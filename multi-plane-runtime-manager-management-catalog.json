@@ -1,0 +1,5 @@
+{
+  "_comment": "Template catalog for management plane. Add tools under 'tools' with command/timeout/type/plane fields.",
+  "_catalog_version": 1,
+  "tools": {}
+}
