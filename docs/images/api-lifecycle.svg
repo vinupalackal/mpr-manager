@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560">
+  <defs>
+    <marker id="arrow2" markerWidth="10" markerHeight="10" refX="10" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#047857"/>
+    </marker>
+    <style>
+      .title { font: 700 26px Arial, sans-serif; fill: #111827; }
+      .step { rx: 10; ry: 10; stroke: #065f46; stroke-width: 2; fill: #ecfdf5; }
+      .label { font: 600 16px Arial, sans-serif; fill: #064e3b; }
+      .text { font: 14px Arial, sans-serif; fill: #065f46; }
+      .arrow { stroke: #047857; stroke-width: 2.5; fill: none; marker-end: url(#arrow2); }
+    </style>
+  </defs>
+
+  <text x="24" y="36" class="title">API Lifecycle: EXEC / DESCRIBE / HEALTH / PUSH</text>
+
+  <rect class="step" x="40" y="90" width="250" height="90"/>
+  <text x="70" y="125" class="label">1. Receive WRP msg_type=3</text>
+  <text x="70" y="150" class="text">Decode transaction_uuid + payload</text>
+
+  <rect class="step" x="340" y="90" width="250" height="90"/>
+  <text x="366" y="125" class="label">2. Detect payload kind</text>
+  <text x="366" y="150" class="text">EXEC | DESCRIBE | HEALTH | PUSH</text>
+
+  <rect class="step" x="640" y="90" width="250" height="90"/>
+  <text x="680" y="125" class="label">3. Route handler</text>
+  <text x="680" y="150" class="text">Policy + catalog + plugin path</text>
+
+  <rect class="step" x="940" y="90" width="220" height="90"/>
+  <text x="975" y="125" class="label">4. Build response</text>
+  <text x="975" y="150" class="text">msg_type=3 payload</text>
+
+  <rect class="step" x="100" y="260" width="220" height="95"/>
+  <text x="125" y="295" class="label">EXEC</text>
+  <text x="125" y="318" class="text">Tool invoke / exit code</text>
+  <text x="125" y="338" class="text">stdout or error token</text>
+
+  <rect class="step" x="380" y="260" width="220" height="95"/>
+  <text x="400" y="295" class="label">DESCRIBE</text>
+  <text x="400" y="318" class="text">Plane manifest summary</text>
+  <text x="400" y="338" class="text">tools + metadata</text>
+
+  <rect class="step" x="660" y="260" width="220" height="95"/>
+  <text x="690" y="295" class="label">HEALTH</text>
+  <text x="690" y="318" class="text">Lightweight status check</text>
+  <text x="690" y="338" class="text">{"status":"ok"}</text>
+
+  <rect class="step" x="940" y="260" width="220" height="95"/>
+  <text x="980" y="295" class="label">PUSH</text>
+  <text x="980" y="318" class="text">Versioned catalog update</text>
+  <text x="980" y="338" class="text">Triggers CHANGED event</text>
+
+  <rect class="step" x="360" y="430" width="480" height="90"/>
+  <text x="392" y="466" class="label">Async Notifications</text>
+  <text x="392" y="489" class="text">CHANGED(kind=CHANGED) + capability_sync.updated after successful PUSH</text>
+
+  <line class="arrow" x1="290" y1="135" x2="340" y2="135"/>
+  <line class="arrow" x1="590" y1="135" x2="640" y2="135"/>
+  <line class="arrow" x1="890" y1="135" x2="940" y2="135"/>
+
+  <line class="arrow" x1="760" y1="180" x2="210" y2="260"/>
+  <line class="arrow" x1="760" y1="180" x2="490" y2="260"/>
+  <line class="arrow" x1="760" y1="180" x2="770" y2="260"/>
+  <line class="arrow" x1="760" y1="180" x2="1050" y2="260"/>
+
+  <line class="arrow" x1="1050" y1="355" x2="760" y2="430"/>
+</svg>
