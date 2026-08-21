@@ -23,6 +23,33 @@ static int in_set(const char *value, const char *const *set, size_t n)
     return 0;
 }
 
+const char *meta_plane_canonical(const char *plane, int *was_normalized)
+{
+    if (was_normalized) *was_normalized = 0;
+    if (!plane || !*plane)
+        return NULL;
+
+    if (strcmp(plane, "triage") == 0) return "triage";
+    if (strcmp(plane, "management") == 0) return "management";
+    if (strcmp(plane, "control") == 0) return "control";
+    if (strcmp(plane, "config-apply") == 0) return "config-apply";
+
+    if (strcmp(plane, "diagnostic") == 0) {
+        if (was_normalized) *was_normalized = 1;
+        return "triage";
+    }
+    if (strcmp(plane, "ops") == 0) {
+        if (was_normalized) *was_normalized = 1;
+        return "management";
+    }
+    if (strcmp(plane, "data") == 0) {
+        if (was_normalized) *was_normalized = 1;
+        return "triage";
+    }
+
+    return NULL;
+}
+
 static void set_reason(char *reason, size_t reason_len, const char *msg)
 {
     if (!reason || reason_len == 0) return;
@@ -82,7 +109,6 @@ meta_status_t meta_validate(const req_metadata_t *m,
                             char *reason,
                             size_t reason_len)
 {
-    static const char *const planes[] = {"data", "control", "ops", "diagnostic"};
     static const char *const plane_types[] = {"read", "write", "exec", "observe"};
 
     set_reason(reason, reason_len, NULL);
@@ -101,7 +127,7 @@ meta_status_t meta_validate(const req_metadata_t *m,
     }
 
     if (cfg->strict_mode) {
-        if (m->plane && !in_set(m->plane, planes, sizeof(planes) / sizeof(planes[0]))) {
+        if (m->plane && !meta_plane_canonical(m->plane, NULL)) {
             set_reason(reason, reason_len, "invalid plane");
             return META_ERR_POLICY;
         }

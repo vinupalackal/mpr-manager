@@ -98,8 +98,10 @@ Directories:
   - `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DIR_CONFIG_APPLY`
 
 Reload:
-- Poll mode via `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_POLL_INTERVAL_SEC`
-- Linux notify/manual reload path available
+- Discovery mode via `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DISCOVERY_MODE=hybrid|notify|poll`
+- Reconcile interval via `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_POLL_INTERVAL_SEC` (default 60)
+- Debounce via `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DEBOUNCE_MS` (default 200)
+- v1 policy: periodic reconcile is always enabled when plugins are enabled; `notify` is treated as notify + periodic reconcile.
 
 ### 6.1 Example plugin details (included in repository)
 

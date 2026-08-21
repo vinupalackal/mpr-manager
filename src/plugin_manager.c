@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <poll.h>
 #if defined(__linux__)
 #include <sys/inotify.h>
 #endif
@@ -23,7 +24,8 @@
 typedef enum {
     WATCH_MODE_NONE = 0,
     WATCH_MODE_POLL,
-    WATCH_MODE_NOTIFY
+    WATCH_MODE_NOTIFY,
+    WATCH_MODE_HYBRID
 } watcher_mode_t;
 
 typedef enum {
@@ -67,6 +69,7 @@ struct plugin_manager {
     diag_host_api_t host;
 
     pthread_mutex_t lock;
+    pthread_mutex_t scan_lock;
     pthread_t watcher_tid;
     int watcher_running;
     watcher_mode_t watcher_mode;
@@ -84,6 +87,12 @@ struct plugin_manager {
     plugin_record_t *plugins;
     plugin_metrics_t metrics;
 };
+
+typedef struct {
+    char *path;
+    unsigned long long mtime_ns;
+    off_t file_size;
+} scan_entry_t;
 
 static char *trim_ws_inplace(char *s)
 {
@@ -138,6 +147,34 @@ static int is_so_file(const char *name)
     if (!name) return 0;
     n = strlen(name);
     return (n > 3 && strcmp(name + n - 3, ".so") == 0);
+}
+
+static const char *watch_mode_name(watcher_mode_t mode)
+{
+    switch (mode) {
+    case WATCH_MODE_POLL: return "poll";
+    case WATCH_MODE_NOTIFY: return "notify";
+    case WATCH_MODE_HYBRID: return "hybrid";
+    case WATCH_MODE_NONE:
+    default:
+        return "none";
+    }
+}
+
+static int watcher_cfg_poll_sec(const plugin_manager_t *pm)
+{
+    int sec = pm ? pm->cfg.poll_interval_sec : 0;
+    return sec > 0 ? sec : 60;
+}
+
+static void debounce_wait_ms(const plugin_manager_t *pm)
+{
+    int ms = pm ? pm->cfg.debounce_ms : 0;
+    if (ms <= 0)
+        return;
+    if (ms > 5000)
+        ms = 5000;
+    usleep((useconds_t)ms * 1000U);
 }
 
 static void pm_log(plugin_manager_t *pm, int level, const char *fmt, ...)
@@ -220,7 +257,14 @@ static void unload_plugin_locked(plugin_manager_t *pm, plugin_record_t *pr)
     tool_registry_unbind_plugin_tools(pr);
 
     while (atomic_load(&pr->in_flight) > 0 && tries < 500) {
+        /*
+         * Phase-2.1: avoid holding pm->lock while waiting for in-flight
+         * invocations to drain. This keeps unrelated invoke lookups responsive
+         * during unload/reload churn.
+         */
+        pthread_mutex_unlock(&pm->lock);
         usleep(10000);
+        pthread_mutex_lock(&pm->lock);
         tries++;
     }
 
@@ -425,6 +469,98 @@ static int reload_plugin_locked(plugin_manager_t *pm, plugin_record_t *pr)
     return -1;
 }
 
+static int scan_entry_append(scan_entry_t **entries,
+                             size_t *count,
+                             size_t *cap,
+                             const char *path,
+                             const struct stat *st)
+{
+    scan_entry_t *tmp;
+    char *dup;
+
+    if (!entries || !count || !cap || !path || !st)
+        return -1;
+
+    if (*count == *cap) {
+        size_t new_cap = (*cap == 0) ? 16 : (*cap * 2);
+        tmp = (scan_entry_t *)realloc(*entries, new_cap * sizeof(**entries));
+        if (!tmp)
+            return -1;
+        *entries = tmp;
+        *cap = new_cap;
+    }
+
+    dup = strdup(path);
+    if (!dup)
+        return -1;
+
+    (*entries)[*count].path = dup;
+    (*entries)[*count].mtime_ns = stat_mtime_ns(st);
+    (*entries)[*count].file_size = st->st_size;
+    (*count)++;
+    return 0;
+}
+
+static void scan_entries_free(scan_entry_t *entries, size_t count)
+{
+    size_t i;
+    if (!entries)
+        return;
+    for (i = 0; i < count; i++)
+        free(entries[i].path);
+    free(entries);
+}
+
+static void collect_scan_entries(plugin_manager_t *pm,
+                                 scan_entry_t **entries,
+                                 size_t *entry_count)
+{
+    size_t d_idx;
+    size_t cap = 0;
+
+    *entries = NULL;
+    *entry_count = 0;
+
+    for (d_idx = 0; d_idx < pm->plugin_dir_count; d_idx++) {
+        DIR *d = opendir(pm->plugin_dirs[d_idx]);
+        struct dirent *ent;
+        if (!d) {
+            pm_log(pm, 4, "plugin_scan_open_failed dir=%s err=%s",
+                   pm->plugin_dirs[d_idx], strerror(errno));
+            continue;
+        }
+
+        while ((ent = readdir(d)) != NULL) {
+            char full[PATH_MAX];
+            char normalized[PATH_MAX];
+            struct stat st;
+            int n;
+
+            if (ent->d_name[0] == '.')
+                continue;
+            if (!is_so_file(ent->d_name))
+                continue;
+
+            n = snprintf(full, sizeof(full), "%s/%s", pm->plugin_dirs[d_idx], ent->d_name);
+            if (n < 0 || (size_t)n >= sizeof(full))
+                continue;
+
+            if (!realpath(full, normalized))
+                continue;
+
+            if (stat(normalized, &st) != 0)
+                continue;
+
+            if (scan_entry_append(entries, entry_count, &cap, normalized, &st) != 0) {
+                pm_log(pm, 4, "plugin_scan_collect_oom path=%s", normalized);
+                continue;
+            }
+        }
+
+        closedir(d);
+    }
+}
+
 static void *watcher_main(void *arg)
 {
     plugin_manager_t *pm = (plugin_manager_t *)arg;
@@ -434,7 +570,7 @@ static void *watcher_main(void *arg)
 
     if (pm->watcher_mode == WATCH_MODE_POLL) {
         while (pm->watcher_running) {
-            int sec = pm->cfg.poll_interval_sec > 0 ? pm->cfg.poll_interval_sec : 3;
+            int sec = watcher_cfg_poll_sec(pm);
             for (int i = 0; i < sec && pm->watcher_running; i++)
                 sleep(1);
             if (!pm->watcher_running)
@@ -461,6 +597,47 @@ static void *watcher_main(void *arg)
             }
 
             plugin_manager_scan(pm);
+        }
+        return NULL;
+    }
+
+    if (pm->watcher_mode == WATCH_MODE_HYBRID) {
+        char evbuf[4096];
+        while (pm->watcher_running) {
+            struct pollfd pfd;
+            int rc;
+            int timeout_ms = watcher_cfg_poll_sec(pm) * 1000;
+
+            pfd.fd = pm->notify_fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+
+            rc = poll(&pfd, 1, timeout_ms);
+            if (rc == 0) {
+                plugin_manager_scan(pm); /* periodic reconcile */
+                continue;
+            }
+
+            if (rc < 0) {
+                if (errno == EINTR)
+                    continue;
+                pm_log(pm, 4, "plugin_watcher_poll_err mode=hybrid err=%s", strerror(errno));
+                plugin_manager_scan(pm);
+                usleep(100000);
+                continue;
+            }
+
+            if (pfd.revents & POLLIN) {
+                ssize_t n = read(pm->notify_fd, evbuf, sizeof(evbuf));
+                if (n < 0 && errno != EINTR) {
+                    pm_log(pm, 4, "plugin_watcher_notify_read_err mode=hybrid err=%s", strerror(errno));
+                }
+                plugin_manager_scan(pm);
+            } else if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                pm_log(pm, 4, "plugin_watcher_notify_fd_state mode=hybrid revents=0x%x", pfd.revents);
+                plugin_manager_scan(pm);
+                usleep(100000);
+            }
         }
         return NULL;
     }
@@ -492,6 +669,10 @@ int plugin_manager_init(plugin_manager_t **out_pm,
         pm->cfg.poll_interval_sec = 0;
     if (!pm->cfg.verify_mode)
         pm->cfg.verify_mode = "off";
+    if (!pm->cfg.discovery_mode || !*pm->cfg.discovery_mode)
+        pm->cfg.discovery_mode = "hybrid";
+    if (pm->cfg.debounce_ms < 0)
+        pm->cfg.debounce_ms = 0;
 
     pm->watcher_mode = WATCH_MODE_NONE;
 #if defined(__linux__)
@@ -502,6 +683,7 @@ int plugin_manager_init(plugin_manager_t **out_pm,
 #endif
 
     pthread_mutex_init(&pm->lock, NULL);
+    pthread_mutex_init(&pm->scan_lock, NULL);
     tool_registry_init();
 
     split_plugin_dirs(pm);
@@ -512,6 +694,10 @@ int plugin_manager_init(plugin_manager_t **out_pm,
 
 int plugin_manager_start(plugin_manager_t *pm)
 {
+    const char *mode_s;
+    int want_poll = 0;
+    int want_notify = 0;
+
     if (!pm)
         return -1;
     if (!pm->cfg.enabled)
@@ -519,7 +705,26 @@ int plugin_manager_start(plugin_manager_t *pm)
 
     plugin_manager_scan(pm);
 
-    if (pm->cfg.poll_interval_sec > 0) {
+    mode_s = pm->cfg.discovery_mode ? pm->cfg.discovery_mode : "hybrid";
+    if (strcmp(mode_s, "poll") == 0) {
+        want_poll = 1;
+    } else if (strcmp(mode_s, "notify") == 0) {
+        want_notify = 1;
+        want_poll = 1; /* v1 policy: periodic reconcile is mandatory */
+    } else { /* hybrid or unknown */
+        want_poll = 1;
+        want_notify = 1;
+    }
+
+    if (want_poll && pm->cfg.poll_interval_sec <= 0)
+        pm->cfg.poll_interval_sec = 60;
+
+    if (strcmp(mode_s, "notify") == 0) {
+        pm_log(pm, 6, "plugin_watcher_v1_policy_enforced requested_mode=notify effective_mode=hybrid poll_interval=%d",
+               pm->cfg.poll_interval_sec);
+    }
+
+    if (want_poll && !want_notify) {
         pm->watcher_mode = WATCH_MODE_POLL;
         pm->watcher_running = 1;
         if (pthread_create(&pm->watcher_tid, NULL, watcher_main, pm) != 0) {
@@ -528,14 +733,18 @@ int plugin_manager_start(plugin_manager_t *pm)
             return -1;
         }
 
-        pm_log(pm, 6, "plugin_watcher_started mode=poll dir=%s poll_interval=%d",
-               pm->cfg.plugin_dir, pm->cfg.poll_interval_sec);
+        pm_log(pm, 6, "plugin_watcher_started mode=%s dir=%s poll_interval=%d debounce_ms=%d",
+               watch_mode_name(pm->watcher_mode),
+             pm->cfg.plugin_dir, pm->cfg.poll_interval_sec, pm->cfg.debounce_ms);
         return 0;
     }
 
 #if defined(__linux__)
-    pm->notify_fd = inotify_init1(IN_CLOEXEC);
-    if (pm->notify_fd >= 0) {
+    if (want_notify) {
+        pm->notify_fd = inotify_init1(IN_CLOEXEC);
+    }
+
+    if (want_notify && pm->notify_fd >= 0) {
         size_t i;
         for (i = 0; i < pm->plugin_dir_count && i < MAX_PLUGIN_DIRS; i++) {
             int wd = inotify_add_watch(pm->notify_fd,
@@ -551,8 +760,8 @@ int plugin_manager_start(plugin_manager_t *pm)
         }
     }
 
-    if (pm->notify_fd >= 0 && pm->notify_watch_count > 0) {
-        pm->watcher_mode = WATCH_MODE_NOTIFY;
+    if (want_notify && pm->notify_fd >= 0 && pm->notify_watch_count > 0) {
+        pm->watcher_mode = want_poll ? WATCH_MODE_HYBRID : WATCH_MODE_NOTIFY;
         pm->watcher_running = 1;
         if (pthread_create(&pm->watcher_tid, NULL, watcher_main, pm) != 0) {
             size_t i;
@@ -570,12 +779,15 @@ int plugin_manager_start(plugin_manager_t *pm)
             return -1;
         }
 
-        pm_log(pm, 6, "plugin_watcher_started mode=notify dir=%s poll_interval=0",
-               pm->cfg.plugin_dir);
+        pm_log(pm, 6, "plugin_watcher_started mode=%s dir=%s poll_interval=%d debounce_ms=%d",
+               watch_mode_name(pm->watcher_mode),
+               pm->cfg.plugin_dir,
+               pm->cfg.poll_interval_sec,
+               pm->cfg.debounce_ms);
         return 0;
     }
 
-    if (pm->notify_fd >= 0) {
+    if (want_notify && pm->notify_fd >= 0) {
         size_t i;
         for (i = 0; i < pm->notify_watch_count; i++) {
             if (pm->notify_watch[i] >= 0)
@@ -587,8 +799,39 @@ int plugin_manager_start(plugin_manager_t *pm)
     for (size_t i = 0; i < MAX_PLUGIN_DIRS; i++)
         pm->notify_watch[i] = -1;
     pm->notify_fd = -1;
+    if (want_poll) {
+        pm->watcher_mode = WATCH_MODE_POLL;
+        pm->watcher_running = 1;
+        if (pthread_create(&pm->watcher_tid, NULL, watcher_main, pm) != 0) {
+            pm->watcher_running = 0;
+            pm->watcher_mode = WATCH_MODE_NONE;
+            return -1;
+        }
+        pm_log(pm, 4, "plugin_watcher_notify_unavailable_fallback mode=poll dirs=%s poll_interval=%d debounce_ms=%d",
+               pm->cfg.plugin_dir,
+               pm->cfg.poll_interval_sec,
+               pm->cfg.debounce_ms);
+        return 0;
+    }
+
     pm_log(pm, 4, "plugin_watcher_disabled mode=notify_unavailable dirs=%s", pm->cfg.plugin_dir);
 #else
+    if (want_poll) {
+        pm->watcher_mode = WATCH_MODE_POLL;
+        pm->watcher_running = 1;
+        if (pthread_create(&pm->watcher_tid, NULL, watcher_main, pm) != 0) {
+            pm->watcher_running = 0;
+            pm->watcher_mode = WATCH_MODE_NONE;
+            return -1;
+        }
+        pm_log(pm, 6, "plugin_watcher_started mode=%s dirs=%s poll_interval=%d debounce_ms=%d",
+               watch_mode_name(pm->watcher_mode),
+               pm->cfg.plugin_dir,
+               pm->cfg.poll_interval_sec,
+               pm->cfg.debounce_ms);
+        return 0;
+    }
+
     pm_log(pm, 6, "plugin_watcher_disabled mode=off dirs=%s poll_interval=0", pm->cfg.plugin_dir);
 #endif
 
@@ -621,6 +864,7 @@ int plugin_manager_stop(plugin_manager_t *pm)
 
     pm->watcher_mode = WATCH_MODE_NONE;
 
+    pthread_mutex_lock(&pm->scan_lock);
     pthread_mutex_lock(&pm->lock);
     p = pm->plugins;
     while (p) {
@@ -631,61 +875,48 @@ int plugin_manager_stop(plugin_manager_t *pm)
     while (pm->plugins)
         remove_plugin_node_locked(pm, pm->plugins);
     pthread_mutex_unlock(&pm->lock);
+    pthread_mutex_unlock(&pm->scan_lock);
 
     return 0;
 }
 
 int plugin_manager_scan(plugin_manager_t *pm)
 {
-    size_t d_idx;
+    scan_entry_t *entries = NULL;
+    size_t entry_count = 0;
+    size_t i;
+    int registry_changed = 0;
 
     if (!pm || !pm->cfg.enabled)
         return 0;
+
+    pthread_mutex_lock(&pm->scan_lock);
+
+    /* Phase-2 lock-scope refinement:
+     * keep debounce and filesystem traversal out of pm->lock to reduce
+     * invoke-path stalls during scan cycles.
+     */
+    debounce_wait_ms(pm);
+    collect_scan_entries(pm, &entries, &entry_count);
 
     pthread_mutex_lock(&pm->lock);
 
     for (plugin_record_t *p = pm->plugins; p; p = p->next)
         p->seen = 0;
 
-    for (d_idx = 0; d_idx < pm->plugin_dir_count; d_idx++) {
-        DIR *d = opendir(pm->plugin_dirs[d_idx]);
-        struct dirent *ent;
-        if (!d) {
-            pm_log(pm, 4, "plugin_scan_open_failed dir=%s err=%s",
-                   pm->plugin_dirs[d_idx], strerror(errno));
+    for (i = 0; i < entry_count; i++) {
+        plugin_record_t *pr = find_plugin_by_path(pm, entries[i].path);
+        if (!pr) {
+            if (load_plugin_locked(pm, entries[i].path) == 0)
+                registry_changed = 1;
             continue;
         }
 
-        while ((ent = readdir(d)) != NULL) {
-            char full[PATH_MAX];
-            char normalized[PATH_MAX];
-            struct stat st;
-            plugin_record_t *pr;
-            if (ent->d_name[0] == '.')
-                continue;
-            if (!is_so_file(ent->d_name))
-                continue;
-
-            snprintf(full, sizeof(full), "%s/%s", pm->plugin_dirs[d_idx], ent->d_name);
-            if (!realpath(full, normalized))
-                continue;
-
-            if (stat(normalized, &st) != 0)
-                continue;
-
-            pr = find_plugin_by_path(pm, normalized);
-            if (!pr) {
-                load_plugin_locked(pm, normalized);
-                continue;
-            }
-
-            pr->seen = 1;
-            if (pr->mtime_ns != stat_mtime_ns(&st) || pr->file_size != st.st_size) {
-                reload_plugin_locked(pm, pr);
-            }
+        pr->seen = 1;
+        if (pr->mtime_ns != entries[i].mtime_ns || pr->file_size != entries[i].file_size) {
+            if (reload_plugin_locked(pm, pr) == 0)
+                registry_changed = 1;
         }
-
-        closedir(d);
     }
 
     {
@@ -697,12 +928,21 @@ int plugin_manager_scan(plugin_manager_t *pm)
                 pm_log(pm, 6, "plugin_removed path=%s", p->path ? p->path : "?");
                 unload_plugin_locked(pm, p);
                 remove_plugin_node_locked(pm, p);
+                registry_changed = 1;
             }
             p = next;
         }
     }
 
     pthread_mutex_unlock(&pm->lock);
+
+    scan_entries_free(entries, entry_count);
+
+    if (registry_changed && pm->cfg.on_registry_changed_cb)
+        pm->cfg.on_registry_changed_cb(pm->cfg.registry_changed_ctx);
+
+    pthread_mutex_unlock(&pm->scan_lock);
+
     return 0;
 }
 
@@ -713,6 +953,7 @@ int plugin_manager_destroy(plugin_manager_t *pm)
 
     plugin_manager_stop(pm);
     tool_registry_destroy();
+    pthread_mutex_destroy(&pm->scan_lock);
     pthread_mutex_destroy(&pm->lock);
     free(pm);
     return 0;
@@ -763,4 +1004,38 @@ void plugin_manager_get_metrics(plugin_manager_t *pm, plugin_metrics_t *out)
 {
     if (!pm || !out) return;
     *out = pm->metrics;
+}
+
+int plugin_manager_get_tool_publish_meta(plugin_manager_t *pm,
+                                         const char *tool_name,
+                                         char *plugin_path_out,
+                                         size_t plugin_path_out_len,
+                                         int *timeout_out)
+{
+    plugin_record_t *pr;
+    size_t i;
+
+    if (!pm || !tool_name || !*tool_name)
+        return -1;
+
+    pthread_mutex_lock(&pm->lock);
+    pr = pm->plugins;
+    while (pr) {
+        if (pr->state == PLUGIN_ACTIVE && pr->tool_names) {
+            for (i = 0; i < pr->tool_count; i++) {
+                if (pr->tool_names[i] && strcmp(pr->tool_names[i], tool_name) == 0) {
+                    if (plugin_path_out && plugin_path_out_len > 0) {
+                        snprintf(plugin_path_out, plugin_path_out_len, "%s", pr->path ? pr->path : "");
+                    }
+                    if (timeout_out)
+                        *timeout_out = 0;
+                    pthread_mutex_unlock(&pm->lock);
+                    return 0;
+                }
+            }
+        }
+        pr = pr->next;
+    }
+    pthread_mutex_unlock(&pm->lock);
+    return 1;
 }

@@ -12,6 +12,8 @@ typedef struct binding_node {
 static pthread_rwlock_t g_lock = PTHREAD_RWLOCK_INITIALIZER;
 static binding_node_t *g_head = NULL;
 
+void tool_registry_snapshot_free(tool_registry_entry_t *entries, size_t count);
+
 static binding_node_t *find_node_unlocked(const char *tool_name)
 {
     binding_node_t *n = g_head;
@@ -128,6 +130,67 @@ int tool_registry_count(void)
     }
     pthread_rwlock_unlock(&g_lock);
     return count;
+}
+
+int tool_registry_snapshot(tool_registry_entry_t **out_entries, size_t *out_count)
+{
+    binding_node_t *n;
+    size_t count = 0;
+    size_t i = 0;
+    tool_registry_entry_t *entries = NULL;
+
+    if (!out_entries || !out_count)
+        return -1;
+
+    *out_entries = NULL;
+    *out_count = 0;
+
+    pthread_rwlock_rdlock(&g_lock);
+    n = g_head;
+    while (n) {
+        count++;
+        n = n->next;
+    }
+
+    if (count == 0) {
+        pthread_rwlock_unlock(&g_lock);
+        return 0;
+    }
+
+    entries = (tool_registry_entry_t *)calloc(count, sizeof(*entries));
+    if (!entries) {
+        pthread_rwlock_unlock(&g_lock);
+        return -2;
+    }
+
+    n = g_head;
+    while (n && i < count) {
+        entries[i].tool_name = n->b.tool_name ? strdup(n->b.tool_name) : NULL;
+        if (n->b.tool_name && !entries[i].tool_name) {
+            pthread_rwlock_unlock(&g_lock);
+            tool_registry_snapshot_free(entries, i);
+            return -2;
+        }
+        entries[i].provider = n->b.provider;
+        entries[i].plugin = n->b.plugin;
+        i++;
+        n = n->next;
+    }
+    pthread_rwlock_unlock(&g_lock);
+
+    *out_entries = entries;
+    *out_count = i;
+    return 0;
+}
+
+void tool_registry_snapshot_free(tool_registry_entry_t *entries, size_t count)
+{
+    size_t i;
+    if (!entries)
+        return;
+    for (i = 0; i < count; i++)
+        free(entries[i].tool_name);
+    free(entries);
 }
 
 void tool_registry_destroy(void)

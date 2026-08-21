@@ -18,7 +18,7 @@ set(CMAKE_C_STANDARD 11)
 option(MULTI_PLANE_RUNTIME_MANAGER_REGISTER_WITH_PARODUS
        "Send the WRP type-9 registration to Parodus at startup" ON)
 option(MULTI_PLANE_RUNTIME_MANAGER_PUSH_REQUIRE_LOCAL_ONLY
-       "Reject a catalog PUSH received via the public (Parodus) pair, accepting it only on the local-only endpoint" OFF)
+    "Reject a catalog PUSH received via the public (Parodus) pair, accepting it only on the local-only endpoint" ON)
 
 # Added 2026-08-19: metadata field parsing/validation/policy module.
 option(MULTI_PLANE_RUNTIME_MANAGER_ENABLE_METADATA_FIELDS
@@ -29,6 +29,9 @@ option(MULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS
 
 option(MULTI_PLANE_RUNTIME_MANAGER_ENABLE_ACL
     "Enable ACL policy-store integration (requires acl_policy_store_query implementation)" OFF)
+
+option(MULTI_PLANE_RUNTIME_MANAGER_ENABLE_CATALOG_LMDB
+    "Enable experimental LMDB catalog backend skeleton (selection/logging only)" OFF)
 
 option(MULTI_PLANE_RUNTIME_MANAGER_BUILD_SAMPLE_PLUGIN
     "Build a sample dynamic plugin shared object as part of default build/install" ON)
@@ -61,6 +64,18 @@ option(MULTI_PLANE_RUNTIME_MANAGER_BUILD_DYNAMIC_PLUGIN_LIVE_TESTS
 option(MULTI_PLANE_RUNTIME_MANAGER_BUILD_FEATURE_MATRIX_SPEC_TESTS
     "Build broad feature-matrix executable spec tests (config/logging/routing/WRP/exec guardrails)" ON)
 
+option(MULTI_PLANE_RUNTIME_MANAGER_BUILD_CAPABILITY_PUBLICATION_UNIT_TESTS
+    "Build capability publication snapshot/merge unit tests" ON)
+
+option(MULTI_PLANE_RUNTIME_MANAGER_BUILD_PHASE1_BASELINE_GUARDRAIL_TESTS
+    "Build phase-1 baseline guardrail latency tests (steady + churn)" ON)
+
+option(MULTI_PLANE_RUNTIME_MANAGER_BUILD_PHASE2_LOCK_SCOPE_TESTS
+    "Build phase-2 lock-scope regression tests" ON)
+
+option(MULTI_PLANE_RUNTIME_MANAGER_BUILD_DB_MODE_TESTS
+    "Build LMDB database-mode tests (requires MULTI_PLANE_RUNTIME_MANAGER_ENABLE_CATALOG_LMDB=ON)" ON)
+
 check_include_file(msgpack.h MULTI_PLANE_RUNTIME_MANAGER_HAVE_MSGPACK_H)
 
 # Corrected 2026-08-14 (docs/24_diag_server_merge_plan.md §2): the source
@@ -70,14 +85,13 @@ check_include_file(msgpack.h MULTI_PLANE_RUNTIME_MANAGER_HAVE_MSGPACK_H)
 # documentation was corrected instead of this line.
 set(MULTI_PLANE_RUNTIME_MANAGER_SOURCES
     src/multi-plane-runtime-manager.c
+    src/catalog_backend.c
     src/metadata_fields.c
+    src/capability_publication.c
 )
 
 if(MULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS)
-    list(APPEND MULTI_PLANE_RUNTIME_MANAGER_SOURCES
-        src/plugin_manager.c
-        src/tool_registry.c
-    )
+    list(APPEND MULTI_PLANE_RUNTIME_MANAGER_SOURCES src/plugin_manager.c src/tool_registry.c)
 endif()
 
 add_executable(multi-plane-runtime-manager ${MULTI_PLANE_RUNTIME_MANAGER_SOURCES})
@@ -93,6 +107,7 @@ target_compile_definitions(multi-plane-runtime-manager PRIVATE
     MULTI_PLANE_RUNTIME_MANAGER_ENABLE_METADATA_FIELDS=$<BOOL:${MULTI_PLANE_RUNTIME_MANAGER_ENABLE_METADATA_FIELDS}>
     MULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS=$<BOOL:${MULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS}>
     MULTI_PLANE_RUNTIME_MANAGER_ENABLE_ACL=$<BOOL:${MULTI_PLANE_RUNTIME_MANAGER_ENABLE_ACL}>
+    MULTI_PLANE_RUNTIME_MANAGER_ENABLE_CATALOG_LMDB=$<BOOL:${MULTI_PLANE_RUNTIME_MANAGER_ENABLE_CATALOG_LMDB}>
 )
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/glibc_version.map")
@@ -130,6 +145,56 @@ target_link_libraries(multi-plane-runtime-manager
     pthread
 )
 
+if(MULTI_PLANE_RUNTIME_MANAGER_ENABLE_CATALOG_LMDB)
+    target_link_libraries(multi-plane-runtime-manager lmdb)
+
+    add_executable(multi-plane-runtime-manager-catalog-lmdb-import
+        src/catalog_lmdb_import.c
+    )
+    target_include_directories(multi-plane-runtime-manager-catalog-lmdb-import PRIVATE
+        ${CMAKE_INSTALL_PREFIX}/include
+        /usr/include/cjson
+    )
+    target_link_directories(multi-plane-runtime-manager-catalog-lmdb-import PRIVATE
+        ${CMAKE_INSTALL_PREFIX}/lib
+    )
+    target_link_libraries(multi-plane-runtime-manager-catalog-lmdb-import
+        cjson
+        lmdb
+    )
+    install(TARGETS multi-plane-runtime-manager-catalog-lmdb-import DESTINATION ${CMAKE_INSTALL_PREFIX}/bin)
+
+    if(MULTI_PLANE_RUNTIME_MANAGER_BUILD_DB_MODE_TESTS)
+        enable_testing()
+
+        add_executable(multi-plane-runtime-manager-catalog-backend-lmdb-mode-tests
+            tests/catalog_backend_lmdb_mode_tests.c
+            src/catalog_backend.c
+        )
+
+        target_compile_definitions(multi-plane-runtime-manager-catalog-backend-lmdb-mode-tests PRIVATE
+            MULTI_PLANE_RUNTIME_MANAGER_ENABLE_CATALOG_LMDB=1
+        )
+
+        target_include_directories(multi-plane-runtime-manager-catalog-backend-lmdb-mode-tests PRIVATE
+            ${CMAKE_INSTALL_PREFIX}/include
+            /usr/include/cjson
+            src
+        )
+
+        target_link_libraries(multi-plane-runtime-manager-catalog-backend-lmdb-mode-tests
+            cjson
+            lmdb
+            pthread
+        )
+
+        add_test(
+            NAME multi-plane-runtime-manager-catalog-backend-lmdb-mode-tests
+            COMMAND multi-plane-runtime-manager-catalog-backend-lmdb-mode-tests
+        )
+    endif()
+endif()
+
 if(MULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS)
     target_link_libraries(multi-plane-runtime-manager ${CMAKE_DL_LIBS})
 endif()
@@ -147,6 +212,11 @@ install(FILES
     multi-plane-runtime-manager-control-catalog.json
     multi-plane-runtime-manager-config-apply-catalog.json
     DESTINATION /etc/multi-plane-runtime-manager
+)
+
+install(FILES
+    systemd/multi-plane-runtime-manager.service
+    DESTINATION /lib/systemd/system
 )
 
 if(MULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS AND MULTI_PLANE_RUNTIME_MANAGER_BUILD_SAMPLE_PLUGIN)
@@ -339,5 +409,132 @@ if(MULTI_PLANE_RUNTIME_MANAGER_BUILD_FEATURE_MATRIX_SPEC_TESTS)
     add_test(
         NAME multi-plane-runtime-manager-feature-matrix-spec-tests
         COMMAND multi-plane-runtime-manager-feature-matrix-spec-tests
+    )
+endif()
+
+if(MULTI_PLANE_RUNTIME_MANAGER_BUILD_CAPABILITY_PUBLICATION_UNIT_TESTS)
+    enable_testing()
+
+    add_executable(multi-plane-runtime-manager-capability-publication-unit-tests
+        tests/capability_publication_unit.c
+        src/capability_publication.c
+    )
+
+    add_test(
+        NAME multi-plane-runtime-manager-capability-publication-unit-tests
+        COMMAND multi-plane-runtime-manager-capability-publication-unit-tests
+    )
+endif()
+
+if(MULTI_PLANE_RUNTIME_MANAGER_BUILD_PHASE1_BASELINE_GUARDRAIL_TESTS)
+    enable_testing()
+
+    if(NOT TARGET multi-plane-runtime-manager-sample-plugin)
+        add_library(multi-plane-runtime-manager-sample-plugin SHARED
+            plugins/sample_multi_plane_runtime_manager_plugin.c
+        )
+        set_target_properties(multi-plane-runtime-manager-sample-plugin PROPERTIES
+            PREFIX ""
+            OUTPUT_NAME "sample_multi_plane_runtime_manager_plugin"
+        )
+    endif()
+
+    add_executable(multi-plane-runtime-manager-phase1-baseline-guardrails
+        tests/phase1_baseline_guardrails.c
+        src/plugin_manager.c
+        src/tool_registry.c
+    )
+
+    target_compile_definitions(multi-plane-runtime-manager-phase1-baseline-guardrails PRIVATE
+        MULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS=1
+    )
+
+    target_link_libraries(multi-plane-runtime-manager-phase1-baseline-guardrails
+        pthread
+        ${CMAKE_DL_LIBS}
+    )
+
+    add_test(
+        NAME multi-plane-runtime-manager-phase1-baseline-guardrails
+        COMMAND multi-plane-runtime-manager-phase1-baseline-guardrails
+    )
+
+    set_tests_properties(multi-plane-runtime-manager-phase1-baseline-guardrails PROPERTIES
+        ENVIRONMENT "MULTI_PLANE_RUNTIME_MANAGER_SAMPLE_PLUGIN_SO=$<TARGET_FILE:multi-plane-runtime-manager-sample-plugin>"
+        SKIP_RETURN_CODE 77
+    )
+endif()
+
+if(MULTI_PLANE_RUNTIME_MANAGER_BUILD_PHASE2_LOCK_SCOPE_TESTS)
+    enable_testing()
+
+    if(NOT TARGET multi-plane-runtime-manager-sample-plugin)
+        add_library(multi-plane-runtime-manager-sample-plugin SHARED
+            plugins/sample_multi_plane_runtime_manager_plugin.c
+        )
+        set_target_properties(multi-plane-runtime-manager-sample-plugin PROPERTIES
+            PREFIX ""
+            OUTPUT_NAME "sample_multi_plane_runtime_manager_plugin"
+        )
+    endif()
+
+    if(NOT TARGET multi-plane-runtime-manager-sample-slow-plugin)
+        add_library(multi-plane-runtime-manager-sample-slow-plugin SHARED
+            plugins/sample_slow_multi_plane_runtime_manager_plugin.c
+        )
+        set_target_properties(multi-plane-runtime-manager-sample-slow-plugin PROPERTIES
+            PREFIX ""
+            OUTPUT_NAME "sample_slow_multi_plane_runtime_manager_plugin"
+        )
+    endif()
+
+    add_executable(multi-plane-runtime-manager-plugin-lock-scope-live-tests
+        tests/plugin_lock_scope_live.c
+        src/plugin_manager.c
+        src/tool_registry.c
+    )
+
+    target_compile_definitions(multi-plane-runtime-manager-plugin-lock-scope-live-tests PRIVATE
+        MULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS=1
+    )
+
+    target_link_libraries(multi-plane-runtime-manager-plugin-lock-scope-live-tests
+        pthread
+        ${CMAKE_DL_LIBS}
+    )
+
+    add_test(
+        NAME multi-plane-runtime-manager-plugin-lock-scope-live-tests
+        COMMAND multi-plane-runtime-manager-plugin-lock-scope-live-tests
+    )
+
+    set_tests_properties(multi-plane-runtime-manager-plugin-lock-scope-live-tests PROPERTIES
+        ENVIRONMENT "MULTI_PLANE_RUNTIME_MANAGER_SAMPLE_PLUGIN_SO=$<TARGET_FILE:multi-plane-runtime-manager-sample-plugin>"
+        SKIP_RETURN_CODE 77
+    )
+
+    add_executable(multi-plane-runtime-manager-plugin-unload-wait-lock-scope-live-tests
+        tests/plugin_unload_wait_lock_scope_live.c
+        src/plugin_manager.c
+        src/tool_registry.c
+    )
+
+    target_compile_definitions(multi-plane-runtime-manager-plugin-unload-wait-lock-scope-live-tests PRIVATE
+        MULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS=1
+    )
+
+    target_link_libraries(multi-plane-runtime-manager-plugin-unload-wait-lock-scope-live-tests
+        pthread
+        ${CMAKE_DL_LIBS}
+    )
+
+    add_test(
+        NAME multi-plane-runtime-manager-plugin-unload-wait-lock-scope-live-tests
+        COMMAND multi-plane-runtime-manager-plugin-unload-wait-lock-scope-live-tests
+    )
+
+    set_tests_properties(multi-plane-runtime-manager-plugin-unload-wait-lock-scope-live-tests PROPERTIES
+        ENVIRONMENT "MULTI_PLANE_RUNTIME_MANAGER_SAMPLE_PLUGIN_SO=$<TARGET_FILE:multi-plane-runtime-manager-sample-plugin>;MULTI_PLANE_RUNTIME_MANAGER_SAMPLE_SLOW_PLUGIN_SO=$<TARGET_FILE:multi-plane-runtime-manager-sample-slow-plugin>"
+        SKIP_RETURN_CODE 77
     )
 endif()

@@ -2,6 +2,7 @@
 #define PLUGIN_MANAGER_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include "plugin_api.h"
 
 typedef struct plugin_manager plugin_manager_t;
@@ -9,12 +10,17 @@ typedef struct plugin_manager plugin_manager_t;
 typedef struct {
     const char *plugin_dir; /* single dir or comma-separated directory list */
     int enabled;
-    int poll_interval_sec; /* >0 poll-based watcher, 0 disables periodic scanning (notify/manual reload only) */
+    int poll_interval_sec; /* periodic reconcile interval in seconds (default 60; v1 mandatory when enabled) */
+    const char *discovery_mode; /* notify|poll|hybrid */
+    int debounce_ms; /* debounce window before loading changed plugin files */
     int conflict_policy; /* 0 reject-plugin-tool, 1 plugin-priority */
     const char *verify_mode; /* off/hash/signature (v1 enforces off) */
 
     int (*catalog_tool_exists_cb)(const char *tool_name, void *ctx);
     void *catalog_ctx;
+
+    void (*on_registry_changed_cb)(void *ctx);
+    void *registry_changed_ctx;
 } plugin_cfg_t;
 
 typedef struct {
@@ -48,5 +54,11 @@ plugin_invoke_result_t plugin_manager_invoke(plugin_manager_t *pm,
                                              diag_invoke_resp_t *resp);
 
 void plugin_manager_get_metrics(plugin_manager_t *pm, plugin_metrics_t *out);
+
+int plugin_manager_get_tool_publish_meta(plugin_manager_t *pm,
+                                         const char *tool_name,
+                                         char *plugin_path_out,
+                                         size_t plugin_path_out_len,
+                                         int *timeout_out);
 
 #endif

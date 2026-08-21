@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ ! -f /usr/include/lmdb.h ]]; then
+  apt-get update
+  apt-get install -y --no-install-recommends liblmdb-dev
+  rm -rf /var/lib/apt/lists/*
+fi
+
 rm -rf build-container
 
 cmake -S . -B build-container -G Ninja \
@@ -18,3 +24,24 @@ cmake -S . -B build-container -G Ninja \
 
 cmake --build build-container -j"$(nproc)"
 ctest --test-dir build-container --output-on-failure
+
+# Dedicated DB-mode lane: LMDB backend enabled + DB-mode tests.
+rm -rf build-container-lmdb
+
+cmake -S . -B build-container-lmdb -G Ninja \
+  -DMULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS=ON \
+  -DMULTI_PLANE_RUNTIME_MANAGER_ENABLE_METADATA_FIELDS=ON \
+  -DMULTI_PLANE_RUNTIME_MANAGER_ENABLE_ACL=OFF \
+  -DMULTI_PLANE_RUNTIME_MANAGER_ENABLE_CATALOG_LMDB=ON \
+  -DMULTI_PLANE_RUNTIME_MANAGER_BUILD_DB_MODE_TESTS=ON \
+  -DMULTI_PLANE_RUNTIME_MANAGER_BUILD_REQUIREMENTS_TESTS=ON \
+  -DMULTI_PLANE_RUNTIME_MANAGER_BUILD_PLUGIN_INTEGRATION_TESTS=ON \
+  -DMULTI_PLANE_RUNTIME_MANAGER_BUILD_METADATA_UNIT_TESTS=ON \
+  -DMULTI_PLANE_RUNTIME_MANAGER_BUILD_METADATA_VECTOR_TESTS=ON \
+  -DMULTI_PLANE_RUNTIME_MANAGER_BUILD_METADATA_MSGPACK_VECTOR_TESTS=ON \
+  -DMULTI_PLANE_RUNTIME_MANAGER_BUILD_DYNAMIC_PLUGIN_UNIT_TESTS=ON \
+  -DMULTI_PLANE_RUNTIME_MANAGER_BUILD_DYNAMIC_PLUGIN_LIVE_TESTS=ON \
+  -DMULTI_PLANE_RUNTIME_MANAGER_BUILD_FEATURE_MATRIX_SPEC_TESTS=ON
+
+cmake --build build-container-lmdb -j"$(nproc)"
+ctest --test-dir build-container-lmdb --output-on-failure

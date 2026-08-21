@@ -79,7 +79,34 @@ Response:
 
 ```json
 {
-  "status": "ok"
+  "status": "ok",
+  "push_guardrails": {
+    "local_only_required": true,
+    "auth_token_configured": false,
+    "rate_limit_mode": "enforce",
+    "payload_limit_mode": "enforce",
+    "min_interval_ms": 250,
+    "max_payload_bytes": 262144,
+    "attempts": 0,
+    "accepted": 0,
+    "observed_rate_limit": 0,
+    "observed_payload_too_large": 0
+  },
+  "catalog_db": {
+    "backend_requested": "lmdb",
+    "backend_effective": "lmdb",
+    "lmdb_build_enabled": true,
+    "fallback_to_json": false,
+    "lmdb_ready": true,
+    "generation": 1,
+    "reload_events": 0,
+    "reload_poll_sec": 10,
+    "cache_entries": 0,
+    "cache_max_entries": 256,
+    "cache_hits": 0,
+    "cache_misses": 0,
+    "cache_evictions": 0
+  }
 }
 ```
 
@@ -96,6 +123,7 @@ Request:
   "plane": "triage",
   "base_version": 12,
   "target_version": 13,
+  "auth_token": "optional-if-configured",
   "diff": {
     "added": {},
     "removed": [],
@@ -105,6 +133,13 @@ Request:
 ```
 
 Response status typically indicates `loaded` or `rejected` with reason.
+
+Notes:
+- Default posture is local-only PUSH transport.
+- If `MULTI_PLANE_RUNTIME_MANAGER_PUSH_AUTH_TOKEN` is configured on device,
+  `auth_token` must match exactly or the request is rejected.
+- Oversized PUSH payloads are rejected by `MULTI_PLANE_RUNTIME_MANAGER_PUSH_MAX_PAYLOAD_BYTES`.
+- Rapid PUSH bursts may be rejected by `MULTI_PLANE_RUNTIME_MANAGER_PUSH_MIN_INTERVAL_MS`.
 
 Use case:
 - Controlled roll-forward of plane tool definitions.

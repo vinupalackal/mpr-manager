@@ -236,6 +236,69 @@ This document defines end-to-end test cases covering all major features and func
 - **Expected**: JSON-RPC notification emitted with updated capabilities/version.
 - **Automation**: New
 
+### TC-MPRM-KIND-009 — Local-only PUSH gate blocks public transport
+- **Feature**: PUSH security hardening
+- **Type**: Negative
+- **Steps**: Send `PUSH` through public endpoint with local-only gate enabled.
+- **Expected**: Request rejected with forbidden-transport reason.
+- **Automation**: Existing (spec-level policy test)
+
+### TC-MPRM-KIND-010 — PUSH auth token enforced when configured
+- **Feature**: PUSH authorization hardening
+- **Type**: Negative/Positive
+- **Steps**: Configure `MULTI_PLANE_RUNTIME_MANAGER_PUSH_AUTH_TOKEN`; send `PUSH` with missing/wrong token, then correct token.
+- **Expected**: Missing/wrong token rejected; exact token accepted.
+- **Automation**: Existing (spec-level policy test)
+
+### TC-MPRM-KIND-011 — PUSH payload size guardrail
+- **Feature**: PUSH availability hardening
+- **Type**: Negative
+- **Steps**: Set `MULTI_PLANE_RUNTIME_MANAGER_PUSH_MAX_PAYLOAD_BYTES`; send request just under and then over threshold.
+- **Expected**: Under-threshold accepted for normal validation path; over-threshold rejected deterministically.
+- **Automation**: Existing (spec-level policy test)
+
+### TC-MPRM-KIND-012 — PUSH request rate limiting
+- **Feature**: PUSH availability hardening
+- **Type**: Negative/Positive
+- **Steps**: Set `MULTI_PLANE_RUNTIME_MANAGER_PUSH_MIN_INTERVAL_MS`; send bursts below and above interval boundary.
+- **Expected**: Requests inside interval rejected as rate-limited; boundary/after-window requests accepted.
+- **Automation**: Existing (spec-level policy test)
+
+### TC-MPRM-KIND-015 — PUSH rejection counters classification
+- **Feature**: PUSH observability
+- **Type**: Unit/Spec
+- **Steps**: Feed representative outcomes (`ok`, transport reject, unauthorized, rate-limit, payload-size, other reject) into metrics classifier.
+- **Expected**: Each outcome increments exactly one expected counter and attempts total remains consistent.
+- **Automation**: Existing (spec-level policy test)
+
+### TC-MPRM-KIND-016 — PUSH guardrail clamp boundaries
+- **Feature**: PUSH safety controls
+- **Type**: Unit/Spec
+- **Steps**: Evaluate min/max clamp boundaries for interval and payload controls with underflow/overflow/nominal values.
+- **Expected**: Values are clamped to deterministic safety bounds.
+- **Automation**: Existing (spec-level policy test)
+
+### TC-MPRM-KIND-017 — Guardrail mode parsing (`enforce|monitor|off`)
+- **Feature**: Rollout safety controls
+- **Type**: Unit/Spec
+- **Steps**: Parse supported/unsupported mode tokens for PUSH guardrails.
+- **Expected**: Supported modes resolve correctly; unknown values fall back to default mode.
+- **Automation**: Existing (spec-level policy test)
+
+### TC-MPRM-KIND-018 — Guardrail mode decision behavior
+- **Feature**: Rollout safety controls
+- **Type**: Unit/Spec
+- **Steps**: Evaluate violation handling under `enforce`, `monitor`, and `off` modes.
+- **Expected**: `enforce` rejects; `monitor`/`off` do not reject.
+- **Automation**: Existing (spec-level policy test)
+
+### TC-MPRM-KIND-019 — Monitor-only observed violation counters
+- **Feature**: PUSH observability
+- **Type**: Unit/Spec
+- **Steps**: Record monitor-mode observed violations for rate-limit/payload-too-large.
+- **Expected**: Observed counters increment without affecting attempt totals.
+- **Automation**: Existing (spec-level policy test)
+
 ---
 
 ## 7) Metadata Features
@@ -363,6 +426,62 @@ This document defines end-to-end test cases covering all major features and func
 - **Expected**: Load reject with explicit unsupported signal.
 - **Automation**: Existing/Partial
 
+### TC-MPRM-LCK-001 — Invoke latency baseline under scan churn
+- **Feature**: Plugin lock-scope hardening guardrail
+- **Type**: Integration/Performance guardrail
+- **Steps**: Run steady invoke samples and invoke samples while concurrent plugin scans run.
+- **Expected**: No invoke failure; latency percentiles remain within configured guardrails.
+- **Automation**: Existing (`multi-plane-runtime-manager-phase1-baseline-guardrails`)
+
+### TC-MPRM-LCK-002 — Invoke remains responsive during scan debounce
+- **Feature**: Lock-scope regression protection
+- **Type**: Integration/Concurrency
+- **Steps**: Configure high plugin debounce, trigger scan with new plugin candidate, invoke an already-active plugin tool during scan debounce window.
+- **Expected**: Invoke succeeds within bounded latency threshold and scan completes successfully.
+- **Automation**: Existing (`multi-plane-runtime-manager-plugin-lock-scope-live-tests`)
+
+### TC-MPRM-LCK-003 — Invoke remains responsive during unload drain wait
+- **Feature**: Lock-scope regression protection
+- **Type**: Integration/Concurrency
+- **Steps**: Keep one plugin invoke in-flight, remove that plugin to trigger unload drain wait, then invoke a different active plugin tool.
+- **Expected**: Second invoke remains bounded (not blocked by unload wait lock hold), and scan/unload completes safely.
+- **Automation**: Existing (`multi-plane-runtime-manager-plugin-unload-wait-lock-scope-live-tests`)
+
+### TC-MPRM-PUB-001 — DESCRIBE publishes aggregate catalog+dynamic set
+- **Feature**: Capability publication
+- **Type**: Integration
+- **Steps**: Load baseline catalog tools, then load plugin with dynamic-only tool; call `DESCRIBE`.
+- **Expected**: `DESCRIBE` includes both catalog and dynamic tools.
+- **Automation**: New
+
+### TC-MPRM-PUB-002 — capability_sync.updated matches DESCRIBE aggregate
+- **Feature**: Publication consistency
+- **Type**: Integration
+- **Steps**: Trigger capability update event and compare emitted capabilities with `DESCRIBE` snapshot for same plane.
+- **Expected**: Same merged set and conflict outcomes.
+- **Automation**: New
+
+### TC-MPRM-PUB-003 — Conflict policy reflected in publication
+- **Feature**: Deterministic merge policy
+- **Type**: Unit/Integration
+- **Steps**: Create catalog/plugin name conflict; run with `reject-plugin-tool` then `plugin-priority`.
+- **Expected**: Published source of conflicting tool follows configured policy.
+- **Automation**: New
+
+### TC-MPRM-PUB-004 — Startup publication after registration
+- **Feature**: Startup capability visibility
+- **Type**: Integration
+- **Steps**: Start runtime and capture outbound registration + first capability publication.
+- **Expected**: Registration remains compatible; startup capability publication emits aggregate state.
+- **Automation**: New
+
+### TC-MPRM-PUB-005 — Publication failure isolation
+- **Feature**: Availability
+- **Type**: Negative
+- **Steps**: Force publication send failure while issuing EXEC/HEALTH requests.
+- **Expected**: Publication error logged/counted; request execution path remains healthy.
+- **Automation**: New
+
 ---
 
 ## 9) Configuration and Environment Overrides
@@ -408,6 +527,13 @@ This document defines end-to-end test cases covering all major features and func
 - **Steps**: Toggle `LOG_TRACE_API` and `LOG_TRACE_DATA_IO` independently.
 - **Expected**: Corresponding log classes enable/disable correctly.
 - **Automation**: New
+
+### TC-MPRM-CFG-007 — Request thread stack size clamp
+- **Feature**: Memory tuning control
+- **Type**: Unit/Spec
+- **Steps**: Apply underflow/nominal/overflow values to `MULTI_PLANE_RUNTIME_MANAGER_REQUEST_THREAD_STACK_BYTES` model.
+- **Expected**: Effective stack size clamps to safe bounds.
+- **Automation**: Existing (spec-level policy test)
 
 ---
 

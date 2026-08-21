@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libnanomsg-dev \
     libmsgpack-dev \
     libcjson-dev \
+    liblmdb-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace

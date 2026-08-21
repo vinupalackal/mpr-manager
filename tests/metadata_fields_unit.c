@@ -47,6 +47,43 @@ int main(void)
     meta_free(&m);
     meta_init(&m);
 
+    /* Strict canonical/alias taxonomy checks */
+    cfg.strict_mode = 1;
+    m.plane = strdup("triage");
+    st = meta_validate(&m, &cfg, reason, sizeof(reason));
+    TASSERT(st == META_OK);
+    meta_free(&m);
+    meta_init(&m);
+
+    m.plane = strdup("diagnostic");
+    st = meta_validate(&m, &cfg, reason, sizeof(reason));
+    TASSERT(st == META_OK);
+    {
+        int normalized = 0;
+        const char *canon = meta_plane_canonical("diagnostic", &normalized);
+        TASSERT(canon != NULL);
+        TASSERT(strcmp(canon, "triage") == 0);
+        TASSERT(normalized == 1);
+    }
+
+    {
+        int normalized = 0;
+        const char *canon = meta_plane_canonical("management", &normalized);
+        TASSERT(canon != NULL);
+        TASSERT(strcmp(canon, "management") == 0);
+        TASSERT(normalized == 0);
+    }
+
+    {
+        int normalized = 0;
+        const char *canon = meta_plane_canonical("unknown", &normalized);
+        TASSERT(canon == NULL);
+        TASSERT(normalized == 0);
+    }
+
+    meta_free(&m);
+    meta_init(&m);
+
     /* dynamic=false + override => policy reject */
     cfg.strict_mode = 0;
     m.has_dynamic = 1;

@@ -1,0 +1,10 @@
+build/
+.git/
+.gitignore
+.vscode/
+*.o
+*.a
+*.so
+*.swp
+*.tmp
+

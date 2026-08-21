@@ -21,16 +21,13 @@ This page is the quick navigation index for all project documentation.
 ## Requirements and design docs
 
 - [REQUIREMENTS.md](REQUIREMENTS.md)
+- [HLD.md](HLD.md)
+- [LLD.md](LLD.md)
 - [ARCHITECTURE.md](ARCHITECTURE.md)
 - [CLOUD_MESSAGE_FORMAT_SPEC.md](CLOUD_MESSAGE_FORMAT_SPEC.md)
 - [DEVICE_SIDE_COMPONENT_DIAGRAM.md](DEVICE_SIDE_COMPONENT_DIAGRAM.md)
 - [DIAGRAM_EXPLAINED.md](DIAGRAM_EXPLAINED.md)
-- [DYNAMIC_PLUGIN_REQUIREMENTS.md](DYNAMIC_PLUGIN_REQUIREMENTS.md)
-- [DYNAMIC_PLUGIN_HLD.md](DYNAMIC_PLUGIN_HLD.md)
-- [DYNAMIC_PLUGIN_LLD.md](DYNAMIC_PLUGIN_LLD.md)
-- [METADATA_FIELDS_REQUIREMENTS.md](METADATA_FIELDS_REQUIREMENTS.md)
-- [METADATA_FIELDS_HLD.md](METADATA_FIELDS_HLD.md)
-- [METADATA_FIELDS_LLD.md](METADATA_FIELDS_LLD.md)
+- [PHASES_IMPLEMENTATION.md](PHASES_IMPLEMENTATION.md)
 - [COMPREHENSIVE_TEST_CASES.md](COMPREHENSIVE_TEST_CASES.md)
 
 ## Visual assets
@@ -46,4 +43,4 @@ This page is the quick navigation index for all project documentation.
 
 - Functional onboarding: User Guide → Cloud-Side Guide → Planes and Use Cases
 - Deep technical review: API/Workflow Guide → Architecture → Requirements
-- Feature internals: Dynamic Plugin docs + Metadata Fields docs
+- Feature internals: Requirements → HLD → LLD + Phase notes

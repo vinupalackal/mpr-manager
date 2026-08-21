@@ -57,6 +57,8 @@ meta_status_t meta_apply_policy(const req_metadata_t *m,
                                 char *reason,
                                 size_t reason_len);
 
+const char *meta_plane_canonical(const char *plane, int *was_normalized);
+
 const char *meta_error_token(meta_status_t st);
 const char *meta_decision_name(meta_decision_t d);
 int meta_error_exit_code(meta_status_t st);

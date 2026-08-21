@@ -55,13 +55,11 @@
  *       Dispatch Core, once Phase C exists)
  *   Both are serviced by the same message loop (see service_one_message())
  *   and every kind's handler dispatches identically regardless of which
- *   socket a request arrived on. PUSH was originally rejected outright
- *   if received via the public pair (see handle_push_request()'s
- *   transport-origin check); as of 2026-08-16, by direct instruction,
- *   that restriction is gated off (PUSH_REQUIRE_LOCAL_ONLY is 0), so
- *   PUSH is now accepted on either pair, with no ACL check on either --
- *   see PUSH_REQUIRE_LOCAL_ONLY's own comment for the exposure this
- *   creates. DESCRIBE/HEALTH/EXEC carry no transport restriction;
+ *   socket a request arrived on. PUSH enforcement is policy-driven:
+ *   by default it is accepted only from the local endpoint
+ *   (PUSH_REQUIRE_LOCAL_ONLY=1), and optionally also requires a shared
+ *   `auth_token` value when MULTI_PLANE_RUNTIME_MANAGER_PUSH_AUTH_TOKEN
+ *   is configured. DESCRIBE/HEALTH/EXEC carry no transport restriction;
  *   EXEC is instead gated per-tool by mprm_acl_check() (§13.4, see
  *   below). The local pair is best-effort:
  *   if its directory isn't provisioned, multi-plane-runtime-manager logs a warning and
@@ -120,6 +118,9 @@
 #include "metadata_fields.h"
 #include "plugin_api.h"
 #include "plugin_manager.h"
+#include "tool_registry.h"
+#include "capability_publication.h"
+#include "catalog_backend.h"
 
 #ifndef MULTI_PLANE_RUNTIME_MANAGER_ENABLE_METADATA_FIELDS
 #define MULTI_PLANE_RUNTIME_MANAGER_ENABLE_METADATA_FIELDS 1
@@ -203,26 +204,18 @@
  * the transition -- see handle_push_request()'s own comment at its
  * `if (!req->from_local)` check for the full original rationale.
  *
- * Set to 0 on 2026-08-16, by direct instruction: PUSH is now accepted
- * on the public pair as well as the local one, unconditionally, with
- * no ACL check either way. This is a considered, requested change, not
- * an oversight -- but it means any WRP-addressable caller that can
- * reach PARODUS_URL (which is reachable again now that
- * REGISTER_WITH_PARODUS is back to 1, above) can push a new catalog to
- * any plane: add/remove/modify tools, including their `command`
- * strings, subject only to the blocklist and program-pin checks
- * `catalog_apply_push()`'s validation step already runs -- there is no
- * check anywhere on *who* is allowed to push. If that's not
- * acceptable, either flip this back to 1 (a single #define, reverting
- * to local-only PUSH) or add a real authorization check ahead of
- * catalog_apply_push(), the same way mprm_acl_check() gates EXEC.
+ * Security posture updated in Phase 3 (2026-08-20): secure-by-default
+ * local-only transport gate plus optional shared-token authorization
+ * (MULTI_PLANE_RUNTIME_MANAGER_PUSH_AUTH_TOKEN). When the token is set,
+ * every PUSH request must include matching payload field
+ * `auth_token`.
  *
  * Added 2026-08-16: guarded with #ifndef so CMakeLists.txt's
- * MULTI_PLANE_RUNTIME_MANAGER_PUSH_REQUIRE_LOCAL_ONLY option (default OFF, matching
- * this source default of 0) can override it at build time, same
+ * MULTI_PLANE_RUNTIME_MANAGER_PUSH_REQUIRE_LOCAL_ONLY option (default ON, matching
+ * this source default of 1) can override it at build time, same
  * pattern as REGISTER_WITH_PARODUS above. */
 #ifndef PUSH_REQUIRE_LOCAL_ONLY
-#define PUSH_REQUIRE_LOCAL_ONLY 0
+#define PUSH_REQUIRE_LOCAL_ONLY 1
 #endif
 #define SERVICE_NAME         "multi-plane-runtime-manager"
 /* Changed 2026-08-15 (§15 B.5): a directory of per-plane catalog files,
@@ -233,6 +226,7 @@
 #define CATALOG_FILE_CONTROL_DEFAULT      "multi-plane-runtime-manager-control-catalog.json"
 #define CATALOG_FILE_CONFIG_APPLY_DEFAULT "multi-plane-runtime-manager-config-apply-catalog.json"
 #define MAX_OUTPUT_BYTES     (64 * 1024)
+#define REQUEST_THREAD_STACK_BYTES_DEFAULT (256 * 1024)
 /* Corrected 2026-08-14 (docs/24_diag_server_merge_plan.md §2, FR-013):
  * previously defined but never referenced anywhere -- no timeout was
  * actually enforced. Now the real fallback used when a catalog entry
@@ -240,6 +234,7 @@
  * resolution in handle_request(). */
 #define DEFAULT_TIMEOUT_SEC  30
 #define RECV_TIMEOUT_MS      2000
+#define PLUGIN_PUBLISH_COALESCE_MS 200
 
 /* WRP message type constants (from wrp-c/include/wrp-c.h) */
 #define WRP_MSG_TYPE_REQ     3
@@ -252,6 +247,14 @@ static const char *BLOCKED_CMDS[] = {
     "mkfs", "fdisk", "mount", "umount", "iptables", "passwd",
     NULL
 };
+
+static long long monotonic_millis(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000L);
+}
 
 /* ── Logging configuration (file + env overrides) ───────────────────────── */
 
@@ -561,6 +564,7 @@ static unsigned long g_meta_policy_rejects = 0;
 #if MULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS
 static plugin_manager_t *g_plugin_manager = NULL;
 static volatile sig_atomic_t g_plugin_reload_requested = 0;
+static volatile sig_atomic_t g_plugin_publish_requested = 0;
 #endif
 
 #define PLUGIN_DIR_DEFAULT "/usr/lib/multi-plane-runtime-manager/plugins"
@@ -623,6 +627,7 @@ typedef struct {
 } catalog_runtime_cfg_t;
 
 static catalog_runtime_cfg_t g_catalog_cfg;
+static mprm_catalog_backend_choice_t g_catalog_backend_choice;
 
 static void catalog_cfg_set(char *dst, size_t dst_sz, const char *src)
 {
@@ -900,7 +905,7 @@ static void detect_cross_plane_collisions(void)
  *     rejected here too (LOG_ERR, returns NULL) rather than guessing via
  *     a silent priority order.
  */
-static cJSON *catalog_lookup(const char *tool, const char *plane)
+static cJSON *catalog_lookup_json(const char *tool, const char *plane)
 {
     if (!tool) return NULL;
 
@@ -933,6 +938,55 @@ static cJSON *catalog_lookup(const char *tool, const char *plane)
     return found;
 }
 
+static cJSON *catalog_lookup_lmdb(const char *tool, const char *plane)
+{
+    char key_used[256];
+
+    if (!tool || !*tool)
+        return NULL;
+
+    if (!mprm_catalog_backend_lmdb_is_ready())
+        return NULL;
+
+    if (plane && *plane)
+        return mprm_catalog_backend_lmdb_lookup_entry_json(plane, tool, key_used, sizeof(key_used));
+
+    {
+        static const char *planes[] = { "triage", "management", "control", "config-apply" };
+        cJSON *found = NULL;
+        int found_count = 0;
+
+        for (size_t i = 0; i < sizeof(planes) / sizeof(planes[0]); i++) {
+            cJSON *entry = mprm_catalog_backend_lmdb_lookup_entry_json(planes[i], tool,
+                                                                        key_used, sizeof(key_used));
+            if (!entry)
+                continue;
+            found_count++;
+            if (!found) {
+                found = entry;
+            } else {
+                cJSON_Delete(entry);
+            }
+        }
+
+        if (found_count > 1) {
+            syslog(LOG_ERR, "tool '%s' ambiguous across %d planes and no 'plane' supplied -- rejecting",
+                   tool, found_count);
+            if (found)
+                cJSON_Delete(found);
+            return NULL;
+        }
+        return found;
+    }
+}
+
+static cJSON *catalog_lookup(const char *tool, const char *plane)
+{
+    if (g_catalog_backend_choice.effective == MPRM_CATALOG_BACKEND_LMDB)
+        return catalog_lookup_lmdb(tool, plane);
+    return catalog_lookup_json(tool, plane);
+}
+
 #if MULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS
 typedef struct {
     int loaded;
@@ -944,6 +998,8 @@ typedef struct {
     char dir_control[PATH_MAX];
     char dir_config_apply[PATH_MAX];
     char dir_effective[PATH_MAX * 4];
+    char discovery_mode[16];
+    char debounce_ms[16];
     char poll_interval_sec[16];
     char conflict_policy[32];
     char verify_mode[32];
@@ -980,7 +1036,9 @@ static void plugin_cfg_defaults(void)
     set_cfg_val(g_plugin_cfg.dir_control, sizeof(g_plugin_cfg.dir_control), "");
     set_cfg_val(g_plugin_cfg.dir_config_apply, sizeof(g_plugin_cfg.dir_config_apply), "");
     set_cfg_val(g_plugin_cfg.dir_effective, sizeof(g_plugin_cfg.dir_effective), PLUGIN_DIR_DEFAULT);
-    set_cfg_val(g_plugin_cfg.poll_interval_sec, sizeof(g_plugin_cfg.poll_interval_sec), "0");
+    set_cfg_val(g_plugin_cfg.discovery_mode, sizeof(g_plugin_cfg.discovery_mode), "hybrid");
+    set_cfg_val(g_plugin_cfg.debounce_ms, sizeof(g_plugin_cfg.debounce_ms), "200");
+    set_cfg_val(g_plugin_cfg.poll_interval_sec, sizeof(g_plugin_cfg.poll_interval_sec), "60");
     set_cfg_val(g_plugin_cfg.conflict_policy, sizeof(g_plugin_cfg.conflict_policy), "reject-plugin-tool");
     set_cfg_val(g_plugin_cfg.verify_mode, sizeof(g_plugin_cfg.verify_mode), "off");
 }
@@ -1082,6 +1140,10 @@ static void plugin_cfg_load_file(void)
             set_cfg_val(g_plugin_cfg.dir_control, sizeof(g_plugin_cfg.dir_control), val);
         else if (strcmp(key, "MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DIR_CONFIG_APPLY") == 0)
             set_cfg_val(g_plugin_cfg.dir_config_apply, sizeof(g_plugin_cfg.dir_config_apply), val);
+        else if (strcmp(key, "MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DISCOVERY_MODE") == 0)
+            set_cfg_val(g_plugin_cfg.discovery_mode, sizeof(g_plugin_cfg.discovery_mode), val);
+        else if (strcmp(key, "MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DEBOUNCE_MS") == 0)
+            set_cfg_val(g_plugin_cfg.debounce_ms, sizeof(g_plugin_cfg.debounce_ms), val);
         else if (strcmp(key, "MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_POLL_INTERVAL_SEC") == 0)
             set_cfg_val(g_plugin_cfg.poll_interval_sec, sizeof(g_plugin_cfg.poll_interval_sec), val);
         else if (strcmp(key, "MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_CONFLICT_POLICY") == 0)
@@ -1116,6 +1178,10 @@ static const char *plugin_cfg_value(const char *env_key)
         return g_plugin_cfg.dir_control;
     if (strcmp(env_key, "MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DIR_CONFIG_APPLY") == 0)
         return g_plugin_cfg.dir_config_apply;
+    if (strcmp(env_key, "MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DISCOVERY_MODE") == 0)
+        return g_plugin_cfg.discovery_mode;
+    if (strcmp(env_key, "MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DEBOUNCE_MS") == 0)
+        return g_plugin_cfg.debounce_ms;
     if (strcmp(env_key, "MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_POLL_INTERVAL_SEC") == 0)
         return g_plugin_cfg.poll_interval_sec;
     if (strcmp(env_key, "MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_CONFLICT_POLICY") == 0)
@@ -1175,6 +1241,10 @@ static const char *mprm_plugin_get_config(const char *key)
         return plugin_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_VERIFY_MODE");
     if (strcmp(key, "plugin.conflict_policy") == 0)
         return plugin_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_CONFLICT_POLICY");
+    if (strcmp(key, "plugin.discovery_mode") == 0)
+        return plugin_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DISCOVERY_MODE");
+    if (strcmp(key, "plugin.debounce_ms") == 0)
+        return plugin_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DEBOUNCE_MS");
     if (strcmp(key, "plugin.poll_interval_sec") == 0)
         return plugin_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_POLL_INTERVAL_SEC");
     return NULL;
@@ -1188,6 +1258,12 @@ static int catalog_tool_exists_cb(const char *tool_name, void *ctx)
     exists = catalog_lookup(tool_name, NULL) ? 1 : 0;
     pthread_mutex_unlock(&g_catalog_mutex);
     return exists;
+}
+
+static void on_plugin_registry_changed(void *ctx)
+{
+    (void)ctx;
+    g_plugin_publish_requested = 1;
 }
 #endif
 
@@ -1556,13 +1632,12 @@ typedef enum {
     PUSH_ERR_VALIDATION_FAILED,
     PUSH_ERR_PERSIST_FAILED,
     /* Added 2026-08-15 (§15 B.4): PUSH received via the public,
-     * Parodus-facing socket rather than the new local-only endpoint.
-     * See handle_push_request()'s transport-origin check. Currently
-     * unreachable as of 2026-08-16 -- PUSH_REQUIRE_LOCAL_ONLY is 0, so
-     * that check never fires -- but the status code is left defined
-     * rather than removed, matching this file's minimal-diff,
-     * single-flag-revert convention. */
+     * Parodus-facing socket rather than the local-only endpoint when
+     * local-only policy is enabled. See handle_push_request(). */
     PUSH_ERR_FORBIDDEN_TRANSPORT,
+    PUSH_ERR_UNAUTHORIZED,
+    PUSH_ERR_RATE_LIMIT,
+    PUSH_ERR_PAYLOAD_TOO_LARGE,
 } push_status_t;
 
 typedef struct {
@@ -1570,6 +1645,100 @@ typedef struct {
     long          new_version;
     char          reason[256];
 } push_outcome_t;
+
+typedef struct {
+    unsigned long attempts;
+    unsigned long accepted;
+    unsigned long rejected_transport;
+    unsigned long rejected_unauthorized;
+    unsigned long rejected_rate_limit;
+    unsigned long rejected_payload_too_large;
+    unsigned long rejected_other;
+    unsigned long observed_rate_limit;
+    unsigned long observed_payload_too_large;
+} push_guard_metrics_t;
+
+typedef enum {
+    PUSH_GUARD_MODE_OFF = 0,
+    PUSH_GUARD_MODE_MONITOR,
+    PUSH_GUARD_MODE_ENFORCE
+} push_guard_mode_t;
+
+static pthread_mutex_t g_push_guard_mutex = PTHREAD_MUTEX_INITIALIZER;
+static long long g_last_push_attempt_ms = 0;
+static push_guard_metrics_t g_push_guard_metrics;
+
+static void push_guard_metrics_record(push_status_t status)
+{
+    pthread_mutex_lock(&g_push_guard_mutex);
+    g_push_guard_metrics.attempts++;
+    if (status == PUSH_OK) {
+        g_push_guard_metrics.accepted++;
+    } else if (status == PUSH_ERR_FORBIDDEN_TRANSPORT) {
+        g_push_guard_metrics.rejected_transport++;
+    } else if (status == PUSH_ERR_UNAUTHORIZED) {
+        g_push_guard_metrics.rejected_unauthorized++;
+    } else if (status == PUSH_ERR_RATE_LIMIT) {
+        g_push_guard_metrics.rejected_rate_limit++;
+    } else if (status == PUSH_ERR_PAYLOAD_TOO_LARGE) {
+        g_push_guard_metrics.rejected_payload_too_large++;
+    } else {
+        g_push_guard_metrics.rejected_other++;
+    }
+    pthread_mutex_unlock(&g_push_guard_mutex);
+}
+
+static void push_guard_metrics_snapshot(push_guard_metrics_t *out, long long *last_attempt_ms_out)
+{
+    if (!out)
+        return;
+    pthread_mutex_lock(&g_push_guard_mutex);
+    *out = g_push_guard_metrics;
+    if (last_attempt_ms_out)
+        *last_attempt_ms_out = g_last_push_attempt_ms;
+    pthread_mutex_unlock(&g_push_guard_mutex);
+}
+
+static void push_guard_metrics_observe_rate_limit(void)
+{
+    pthread_mutex_lock(&g_push_guard_mutex);
+    g_push_guard_metrics.observed_rate_limit++;
+    pthread_mutex_unlock(&g_push_guard_mutex);
+}
+
+static void push_guard_metrics_observe_payload_too_large(void)
+{
+    pthread_mutex_lock(&g_push_guard_mutex);
+    g_push_guard_metrics.observed_payload_too_large++;
+    pthread_mutex_unlock(&g_push_guard_mutex);
+}
+
+static push_guard_mode_t push_guard_mode_effective(const char *cfg_key, push_guard_mode_t def_mode)
+{
+    const char *v = catalog_cfg_value(cfg_key);
+    if (!v || !*v)
+        return def_mode;
+    if (strcasecmp(v, "off") == 0 || strcmp(v, "0") == 0 || strcasecmp(v, "disabled") == 0)
+        return PUSH_GUARD_MODE_OFF;
+    if (strcasecmp(v, "monitor") == 0 || strcasecmp(v, "log-only") == 0 || strcasecmp(v, "observe") == 0)
+        return PUSH_GUARD_MODE_MONITOR;
+    if (strcasecmp(v, "enforce") == 0 || strcmp(v, "1") == 0 || strcasecmp(v, "on") == 0 || strcasecmp(v, "enabled") == 0)
+        return PUSH_GUARD_MODE_ENFORCE;
+    return def_mode;
+}
+
+static const char *push_guard_mode_name(push_guard_mode_t mode)
+{
+    switch (mode) {
+    case PUSH_GUARD_MODE_OFF:
+        return "off";
+    case PUSH_GUARD_MODE_MONITOR:
+        return "monitor";
+    case PUSH_GUARD_MODE_ENFORCE:
+    default:
+        return "enforce";
+    }
+}
 
 /*
  * catalog_apply_push() — Added 2026-08-15 (§15 B.2, extended by §15
@@ -1721,48 +1890,71 @@ static push_outcome_t catalog_apply_push(const char *plane_name, long base_versi
     cJSON_DeleteItemFromObject(candidate, "_catalog_version");
     cJSON_AddNumberToObject(candidate, "_catalog_version", (double)target_version);
 
-    /* §15 B.2.5: persist to disk BEFORE the in-memory promote below --
-     * reject the whole push, not just skip persistence, on any failure
-     * here, so memory and disk can never diverge (see the function
-     * comment's "Failure policy"). */
-    char *serialized = cJSON_PrintUnformatted(candidate);
-    if (!serialized) {
-        out.status = PUSH_ERR_PERSIST_FAILED;
-        snprintf(out.reason, sizeof(out.reason), "failed to serialize candidate catalog");
-        cJSON_Delete(candidate);
-        pthread_mutex_unlock(&pc->push_lock);
-        return out;
-    }
+    /* Persist BEFORE in-memory promote; storage backend depends on
+     * catalog backend mode. */
+    if (g_catalog_backend_choice.effective == MPRM_CATALOG_BACKEND_LMDB) {
+        char lmdb_err[256];
+        if (!mprm_catalog_backend_lmdb_replace_plane_catalog(plane_name, candidate, target_version,
+                                                             lmdb_err, sizeof(lmdb_err))) {
+            const char *lmdb_msg = lmdb_err[0] ? lmdb_err : "unknown error";
+            const size_t reason_prefix_len = sizeof("failed to persist plane to LMDB: ") - 1;
+            const size_t reason_msg_max = (sizeof(out.reason) > reason_prefix_len + 1)
+                                        ? (sizeof(out.reason) - reason_prefix_len - 1)
+                                        : 0;
+            out.status = PUSH_ERR_PERSIST_FAILED;
+            snprintf(out.reason, sizeof(out.reason), "failed to persist plane to LMDB: %.*s",
+                     (int)reason_msg_max, lmdb_msg);
+            cJSON_Delete(candidate);
+            pthread_mutex_unlock(&pc->push_lock);
+            syslog(LOG_ERR, "plane '%s' push rejected: %s", plane_name, out.reason);
+            return out;
+        }
+    } else {
+        /* §15 B.2.5: persist to disk BEFORE the in-memory promote below --
+         * reject the whole push, not just skip persistence, on any failure
+         * here, so memory and disk can never diverge (see the function
+         * comment's "Failure policy"). */
+        char *serialized = cJSON_PrintUnformatted(candidate);
+        if (!serialized) {
+            out.status = PUSH_ERR_PERSIST_FAILED;
+            snprintf(out.reason, sizeof(out.reason), "failed to serialize candidate catalog");
+            cJSON_Delete(candidate);
+            pthread_mutex_unlock(&pc->push_lock);
+            return out;
+        }
 
-    char tmp_path[600];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", pc->loaded_path);
-    int persist_ok = 0;
-    int persist_errno = 0;
-    FILE *wf = fopen(tmp_path, "w");
-    if (wf) {
-        size_t wlen = strlen(serialized);
-        size_t written = fwrite(serialized, 1, wlen, wf);
-        int flush_rc = fflush(wf);
-        int fsync_rc = fsync(fileno(wf));
-        int close_rc = fclose(wf);
-        if (written == wlen && flush_rc == 0 && fsync_rc == 0 && close_rc == 0) {
-            if (rename(tmp_path, pc->loaded_path) == 0) {
-                persist_ok = 1;
-                /* Recommended per §15 B.2.5 point 3: best-effort fsync
-                 * of the containing directory too, since some
-                 * filesystems don't guarantee a rename survives a power
-                 * loss without it -- relevant on a CPE device where an
-                 * unclean reboot mid-push is a real scenario. Failure
-                 * here doesn't undo persist_ok -- the rename itself
-                 * already succeeded; this is defense in depth, not the
-                 * primary durability guarantee. */
-                char dir_path[600];
-                snprintf(dir_path, sizeof(dir_path), "%s", pc->loaded_path);
-                char *slash = strrchr(dir_path, '/');
-                if (slash) {
-                    *slash = '\0';
-                    int dfd = open(dir_path, O_RDONLY);
-                    if (dfd >= 0) { fsync(dfd); close(dfd); }
+        char tmp_path[600];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", pc->loaded_path);
+        int persist_ok = 0;
+        int persist_errno = 0;
+        FILE *wf = fopen(tmp_path, "w");
+        if (wf) {
+            size_t wlen = strlen(serialized);
+            size_t written = fwrite(serialized, 1, wlen, wf);
+            int flush_rc = fflush(wf);
+            int fsync_rc = fsync(fileno(wf));
+            int close_rc = fclose(wf);
+            if (written == wlen && flush_rc == 0 && fsync_rc == 0 && close_rc == 0) {
+                if (rename(tmp_path, pc->loaded_path) == 0) {
+                    persist_ok = 1;
+                    /* Recommended per §15 B.2.5 point 3: best-effort fsync
+                     * of the containing directory too, since some
+                     * filesystems don't guarantee a rename survives a power
+                     * loss without it -- relevant on a CPE device where an
+                     * unclean reboot mid-push is a real scenario. Failure
+                     * here doesn't undo persist_ok -- the rename itself
+                     * already succeeded; this is defense in depth, not the
+                     * primary durability guarantee. */
+                    char dir_path[600];
+                    snprintf(dir_path, sizeof(dir_path), "%s", pc->loaded_path);
+                    char *slash = strrchr(dir_path, '/');
+                    if (slash) {
+                        *slash = '\0';
+                        int dfd = open(dir_path, O_RDONLY);
+                        if (dfd >= 0) { fsync(dfd); close(dfd); }
+                    }
+                } else {
+                    persist_errno = errno;
                 }
             } else {
                 persist_errno = errno;
@@ -1770,20 +1962,18 @@ static push_outcome_t catalog_apply_push(const char *plane_name, long base_versi
         } else {
             persist_errno = errno;
         }
-    } else {
-        persist_errno = errno;
-    }
-    free(serialized);
+        free(serialized);
 
-    if (!persist_ok) {
-        out.status = PUSH_ERR_PERSIST_FAILED;
-        snprintf(out.reason, sizeof(out.reason), "failed to persist catalog to disk: %s",
-                 strerror(persist_errno));
-        unlink(tmp_path);
-        cJSON_Delete(candidate);
-        pthread_mutex_unlock(&pc->push_lock);
-        syslog(LOG_ERR, "plane '%s' push rejected: %s", plane_name, out.reason);
-        return out;
+        if (!persist_ok) {
+            out.status = PUSH_ERR_PERSIST_FAILED;
+            snprintf(out.reason, sizeof(out.reason), "failed to persist catalog to disk: %s",
+                     strerror(persist_errno));
+            unlink(tmp_path);
+            cJSON_Delete(candidate);
+            pthread_mutex_unlock(&pc->push_lock);
+            syslog(LOG_ERR, "plane '%s' push rejected: %s", plane_name, out.reason);
+            return out;
+        }
     }
 
     /* Steps 5/6 (concurrency model, above validate_static_commands()):
@@ -2433,6 +2623,28 @@ static void handle_request(wrp_req_t *req)
     if (meta_cfg.enabled) {
         meta_status = meta_validate(&req->meta, &meta_cfg, meta_reason, sizeof(meta_reason));
         if (meta_status == META_OK) {
+            if (meta_cfg.strict_mode && req->meta.plane && *req->meta.plane) {
+                int was_normalized = 0;
+                const char *canonical = meta_plane_canonical(req->meta.plane, &was_normalized);
+                if (canonical && strcmp(canonical, req->meta.plane) != 0) {
+                    char *np = strdup(canonical);
+                    if (np) {
+                        char old_plane[64];
+                        snprintf(old_plane, sizeof(old_plane), "%s", req->meta.plane);
+                        free(req->meta.plane);
+                        req->meta.plane = np;
+                        syslog(LOG_INFO, "metadata_plane_normalized from=%s to=%s uuid=%s",
+                               old_plane,
+                               req->meta.plane,
+                               req->transaction_uuid ? req->transaction_uuid : "?");
+                    }
+                } else if (canonical) {
+                    syslog(LOG_INFO, "metadata_plane_canonical value=%s uuid=%s",
+                           req->meta.plane,
+                           req->transaction_uuid ? req->transaction_uuid : "?");
+                }
+            }
+
             meta_status = meta_apply_policy(&req->meta, cmd, &meta_allow_override,
                                             &meta_decision, meta_reason, sizeof(meta_reason));
         }
@@ -2626,6 +2838,7 @@ static void handle_request(wrp_req_t *req)
     pthread_mutex_lock(&g_catalog_mutex);
 
     cJSON *entry = catalog_lookup(tool, req_plane);
+    int entry_present = (entry != NULL);
     int timeout_sec = DEFAULT_TIMEOUT_SEC;
     int suppress_stderr = 0;
     char *count_lines_matching = NULL;
@@ -2633,6 +2846,7 @@ static void handle_request(wrp_req_t *req)
     char *plane_dup = NULL;
     int is_skipped = 0;
     const char *skip_reason = NULL;
+    char *skip_reason_dup = NULL;
 
     /* Added 2026-08-14 (init-time static command validation design):
      * check the precomputed skip flag before doing anything else with
@@ -2649,6 +2863,8 @@ static void handle_request(wrp_req_t *req)
         if (is_skipped) {
             cJSON *sr = cJSON_GetObjectItem(entry, "_skip_reason");
             skip_reason = sr ? cJSON_GetStringValue(sr) : "unknown";
+            if (skip_reason)
+                skip_reason_dup = strdup(skip_reason);
         }
     }
 
@@ -2795,6 +3011,11 @@ static void handle_request(wrp_req_t *req)
         if (clm_s) count_lines_matching = strdup(clm_s);
     }
 
+    if (g_catalog_backend_choice.effective == MPRM_CATALOG_BACKEND_LMDB && entry) {
+        cJSON_Delete(entry);
+        entry = NULL;
+    }
+
     /* Added 2026-08-15 (§15 B.2): end of the danger window -- every field
      * this function still needs (cmd, timeout_sec, suppress_stderr,
      * count_lines_matching, is_dynamic, plane_dup, is_skipped,
@@ -2819,13 +3040,14 @@ static void handle_request(wrp_req_t *req)
     } else if (is_skipped) {
         char msg[128];
         snprintf(msg, sizeof(msg), "tool skipped at init: %s",
-                 skip_reason ? skip_reason : "unknown");
+                 skip_reason_dup ? skip_reason_dup : "unknown");
         output = strdup(msg);
     } else {
-        output = strdup(entry ? "command blocked or missing" : "tool not in catalog");
+        output = strdup(entry_present ? "command blocked or missing" : "tool not in catalog");
     }
     free(count_lines_matching);
     free(plane_dup);
+    free(skip_reason_dup);
 
     /* Added 2026-08-16, by direct instruction: log the resolved output --
      * whichever of the three branches above produced it (executed
@@ -3002,36 +3224,178 @@ static void decode_describe_request(const uint8_t *payload, size_t len, char **p
     msgpack_unpacked_destroy(&result);
 }
 
-/* Packs one plane's {plane, version, tools:[{name,type,plane,timeout}]}.
- * Caller must hold g_catalog_mutex -- reads g_planes[idx].catalog/version
- * directly, same discipline handle_request() uses for its own reads. */
-static void pack_one_plane_describe(msgpack_packer *pk, int idx)
+static int cap_entry_push(capability_entry_t **arr,
+                          size_t *count,
+                          size_t *cap,
+                          const capability_entry_t *entry)
 {
-    cJSON *tools = g_planes[idx].catalog ? cJSON_GetObjectItem(g_planes[idx].catalog, "tools") : NULL;
-    int count = 0;
-    for (cJSON *e = tools ? tools->child : NULL; e; e = e->next) count++;
+    capability_entry_t *tmp;
+    if (!arr || !count || !cap || !entry)
+        return -1;
+    if (*count >= *cap) {
+        size_t ncap = (*cap == 0) ? 16 : (*cap * 2);
+        tmp = (capability_entry_t *)realloc(*arr, ncap * sizeof(**arr));
+        if (!tmp)
+            return -1;
+        *arr = tmp;
+        *cap = ncap;
+    }
+    (*arr)[(*count)++] = *entry;
+    return 0;
+}
 
+static int infer_plane_from_plugin_path(const char *path, char *plane_out, size_t plane_out_len)
+{
+    if (!path || !plane_out || plane_out_len == 0)
+        return -1;
+    if (strstr(path, "/triage/") || strstr(path, "_triage")) {
+        snprintf(plane_out, plane_out_len, "%s", "triage");
+        return 0;
+    }
+    if (strstr(path, "/management/") || strstr(path, "_management")) {
+        snprintf(plane_out, plane_out_len, "%s", "management");
+        return 0;
+    }
+    if (strstr(path, "/control/") || strstr(path, "_control")) {
+        snprintf(plane_out, plane_out_len, "%s", "control");
+        return 0;
+    }
+    if (strstr(path, "/config-apply/") || strstr(path, "_config_apply") || strstr(path, "_config-apply")) {
+        snprintf(plane_out, plane_out_len, "%s", "config-apply");
+        return 0;
+    }
+    return -1;
+}
+
+static int publication_conflict_policy(void)
+{
+#if MULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS
+    if (strcmp(g_plugin_cfg.conflict_policy, "plugin-priority") == 0)
+        return 1;
+#endif
+    return 0;
+}
+
+static int build_plane_capability_snapshot(int plane_idx, capability_snapshot_t *out)
+{
+    capability_entry_t *catalog_entries = NULL;
+    capability_entry_t *dynamic_entries = NULL;
+    size_t catalog_count = 0, dynamic_count = 0;
+    size_t catalog_cap = 0, dynamic_cap = 0;
+    int rc;
+
+    if (!out || plane_idx < 0 || plane_idx >= PLANE_COUNT)
+        return -1;
+
+    out->items = NULL;
+    out->count = 0;
+
+    pthread_mutex_lock(&g_catalog_mutex);
+    {
+        cJSON *tools = g_planes[plane_idx].catalog ? cJSON_GetObjectItem(g_planes[plane_idx].catalog, "tools") : NULL;
+        for (cJSON *e = tools ? tools->child : NULL; e; e = e->next) {
+            cJSON *ty = cJSON_GetObjectItem(e, "type");
+            cJSON *tc = cJSON_GetObjectItem(e, "timeout");
+            capability_entry_t ce;
+            memset(&ce, 0, sizeof(ce));
+            snprintf(ce.name, sizeof(ce.name), "%s", e->string ? e->string : "");
+            snprintf(ce.type, sizeof(ce.type), "%s",
+                     (ty && cJSON_GetStringValue(ty)) ? cJSON_GetStringValue(ty) : "static");
+            snprintf(ce.plane, sizeof(ce.plane), "%s", g_planes[plane_idx].plane);
+            ce.timeout = (tc && cJSON_IsNumber(tc)) ? tc->valueint : 0;
+            ce.provider = CAP_PROVIDER_CATALOG;
+            if (cap_entry_push(&catalog_entries, &catalog_count, &catalog_cap, &ce) != 0) {
+                pthread_mutex_unlock(&g_catalog_mutex);
+                free(catalog_entries);
+                free(dynamic_entries);
+                return -1;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_catalog_mutex);
+
+#if MULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS
+    if (g_plugin_manager) {
+        tool_registry_entry_t *entries = NULL;
+        size_t entry_count = 0;
+        if (tool_registry_snapshot(&entries, &entry_count) == 0) {
+            for (size_t i = 0; i < entry_count; i++) {
+                char plugin_path[PATH_MAX];
+                char inferred_plane[32];
+                int timeout = 0;
+                capability_entry_t de;
+
+                if (entries[i].provider != TOOL_PROVIDER_PLUGIN || !entries[i].tool_name)
+                    continue;
+
+                plugin_path[0] = '\0';
+                inferred_plane[0] = '\0';
+                if (plugin_manager_get_tool_publish_meta(g_plugin_manager,
+                                                         entries[i].tool_name,
+                                                         plugin_path,
+                                                         sizeof(plugin_path),
+                                                         &timeout) != 0) {
+                    continue;
+                }
+
+                if (infer_plane_from_plugin_path(plugin_path, inferred_plane, sizeof(inferred_plane)) != 0)
+                    continue;
+                if (strcmp(inferred_plane, g_planes[plane_idx].plane) != 0)
+                    continue;
+
+                memset(&de, 0, sizeof(de));
+                snprintf(de.name, sizeof(de.name), "%s", entries[i].tool_name);
+                snprintf(de.type, sizeof(de.type), "%s", "dynamic");
+                snprintf(de.plane, sizeof(de.plane), "%s", inferred_plane);
+                de.timeout = timeout;
+                de.provider = CAP_PROVIDER_PLUGIN;
+                if (cap_entry_push(&dynamic_entries, &dynamic_count, &dynamic_cap, &de) != 0) {
+                    tool_registry_snapshot_free(entries, entry_count);
+                    free(catalog_entries);
+                    free(dynamic_entries);
+                    return -1;
+                }
+            }
+            tool_registry_snapshot_free(entries, entry_count);
+        }
+    }
+#endif
+
+    rc = capability_snapshot_build(catalog_entries,
+                                   catalog_count,
+                                   dynamic_entries,
+                                   dynamic_count,
+                                   publication_conflict_policy(),
+                                   out);
+
+    free(catalog_entries);
+    free(dynamic_entries);
+    return rc;
+}
+
+/* Packs one plane's {plane, version, tools:[{name,type,plane,timeout}]}. */
+static void pack_one_plane_describe(msgpack_packer *pk, int idx, const capability_snapshot_t *snap)
+{
     msgpack_pack_map(pk, 3);
     pack_str_kv(pk, "plane", g_planes[idx].plane);
     msgpack_pack_str(pk, 7); msgpack_pack_str_body(pk, "version", 7);
     msgpack_pack_int(pk, (int)g_planes[idx].version);
     msgpack_pack_str(pk, 5); msgpack_pack_str_body(pk, "tools", 5);
-    msgpack_pack_array(pk, count);
-    for (cJSON *e = tools ? tools->child : NULL; e; e = e->next) {
-        cJSON *ty = cJSON_GetObjectItem(e, "type");
-        cJSON *pl = cJSON_GetObjectItem(e, "plane");
-        cJSON *tc = cJSON_GetObjectItem(e, "timeout");
-        const char *name    = e->string ? e->string : "";
-        const char *type_s  = (ty && cJSON_GetStringValue(ty)) ? cJSON_GetStringValue(ty) : "static";
-        const char *plane_s = (pl && cJSON_GetStringValue(pl)) ? cJSON_GetStringValue(pl) : "";
-        int timeout_v = (tc && cJSON_IsNumber(tc)) ? tc->valueint : 0;
 
+    if (!snap || !snap->items || snap->count == 0) {
+        msgpack_pack_array(pk, 0);
+        return;
+    }
+
+    msgpack_pack_array(pk, (uint32_t)snap->count);
+    for (size_t i = 0; i < snap->count; i++) {
+        const capability_entry_t *e = &snap->items[i];
         msgpack_pack_map(pk, 4);
-        pack_str_kv(pk, "name", name);
-        pack_str_kv(pk, "type", type_s);
-        pack_str_kv(pk, "plane", plane_s);
+        pack_str_kv(pk, "name", e->name);
+        pack_str_kv(pk, "type", e->type);
+        pack_str_kv(pk, "plane", e->plane);
         msgpack_pack_str(pk, 7); msgpack_pack_str_body(pk, "timeout", 7);
-        msgpack_pack_int(pk, timeout_v);
+        msgpack_pack_int(pk, e->timeout);
     }
 }
 
@@ -3052,28 +3416,50 @@ static void *build_describe_response_payload(const char *plane, size_t *out_len)
     msgpack_sbuffer_init(&sbuf);
     msgpack_packer_init(&pk, &sbuf, msgpack_sbuffer_write);
 
-    pthread_mutex_lock(&g_catalog_mutex);
-
     if (plane) {
         int idx = -1;
+        capability_snapshot_t snap;
+        memset(&snap, 0, sizeof(snap));
         for (int i = 0; i < PLANE_COUNT; i++)
             if (strcmp(g_planes[i].plane, plane) == 0) { idx = i; break; }
-        if (idx >= 0 && g_planes[idx].catalog) {
-            pack_one_plane_describe(&pk, idx);
+        if (idx >= 0) {
+            if (build_plane_capability_snapshot(idx, &snap) == 0) {
+                pack_one_plane_describe(&pk, idx, &snap);
+                capability_snapshot_free(&snap);
+            } else {
+                msgpack_pack_map(&pk, 0);
+            }
         } else {
             /* Unknown or unloaded plane: an empty map, not an error --
              * matches DESCRIBE's read-only, side-effect-free nature. */
             msgpack_pack_map(&pk, 0);
         }
     } else {
-        int loaded_count = 0;
-        for (int i = 0; i < PLANE_COUNT; i++) if (g_planes[i].catalog) loaded_count++;
-        msgpack_pack_array(&pk, loaded_count);
-        for (int i = 0; i < PLANE_COUNT; i++)
-            if (g_planes[i].catalog) pack_one_plane_describe(&pk, i);
-    }
+        capability_snapshot_t snaps[PLANE_COUNT];
+        int include[PLANE_COUNT];
+        int include_count = 0;
+        memset(snaps, 0, sizeof(snaps));
+        memset(include, 0, sizeof(include));
 
-    pthread_mutex_unlock(&g_catalog_mutex);
+        for (int i = 0; i < PLANE_COUNT; i++) {
+            if (build_plane_capability_snapshot(i, &snaps[i]) != 0)
+                continue;
+            if (snaps[i].count > 0 || g_planes[i].catalog) {
+                include[i] = 1;
+                include_count++;
+            }
+        }
+
+        msgpack_pack_array(&pk, include_count);
+        for (int i = 0; i < PLANE_COUNT; i++) {
+            if (!include[i]) {
+                capability_snapshot_free(&snaps[i]);
+                continue;
+            }
+            pack_one_plane_describe(&pk, i, &snaps[i]);
+            capability_snapshot_free(&snaps[i]);
+        }
+    }
 
     void *data = malloc(sbuf.size);
     if (data) { memcpy(data, sbuf.data, sbuf.size); *out_len = sbuf.size; }
@@ -3124,11 +3510,134 @@ static void *build_health_response_payload(size_t *out_len)
 {
     msgpack_sbuffer sbuf;
     msgpack_packer  pk;
+    const char *push_auth_expected;
+    const char *push_local_only_cfg;
+    const char *push_min_interval_cfg;
+    const char *push_max_payload_cfg;
+    int push_local_only;
+    int push_min_interval_ms;
+    int push_max_payload_bytes;
+    int push_auth_token_configured;
+    push_guard_mode_t push_rate_limit_mode;
+    push_guard_mode_t push_payload_limit_mode;
+    push_guard_metrics_t push_metrics;
+    long long last_push_attempt_ms = 0;
+    mprm_lmdb_cache_stats_t lmdb_stats;
+    const char *backend_requested;
+    const char *backend_effective;
+    int lmdb_ready;
+
     msgpack_sbuffer_init(&sbuf);
     msgpack_packer_init(&pk, &sbuf, msgpack_sbuffer_write);
 
-    msgpack_pack_map(&pk, 1);
+    memset(&push_metrics, 0, sizeof(push_metrics));
+    memset(&lmdb_stats, 0, sizeof(lmdb_stats));
+    push_guard_metrics_snapshot(&push_metrics, &last_push_attempt_ms);
+    mprm_catalog_backend_lmdb_cache_stats(&lmdb_stats);
+
+    backend_requested = mprm_catalog_backend_name(g_catalog_backend_choice.requested);
+    backend_effective = mprm_catalog_backend_name(g_catalog_backend_choice.effective);
+    lmdb_ready = mprm_catalog_backend_lmdb_is_ready() ? 1 : 0;
+
+    push_local_only_cfg = catalog_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_PUSH_REQUIRE_LOCAL_ONLY");
+    push_auth_expected = catalog_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_PUSH_AUTH_TOKEN");
+    push_min_interval_cfg = catalog_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_PUSH_MIN_INTERVAL_MS");
+    push_max_payload_cfg = catalog_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_PUSH_MAX_PAYLOAD_BYTES");
+    push_rate_limit_mode = push_guard_mode_effective("MULTI_PLANE_RUNTIME_MANAGER_PUSH_RATE_LIMIT_MODE", PUSH_GUARD_MODE_ENFORCE);
+    push_payload_limit_mode = push_guard_mode_effective("MULTI_PLANE_RUNTIME_MANAGER_PUSH_PAYLOAD_LIMIT_MODE", PUSH_GUARD_MODE_ENFORCE);
+
+    push_local_only = mprm_parse_bool(push_local_only_cfg, PUSH_REQUIRE_LOCAL_ONLY ? 1 : 0);
+    push_min_interval_ms = push_min_interval_cfg ? atoi(push_min_interval_cfg) : 250;
+    if (push_min_interval_ms < 0)
+        push_min_interval_ms = 0;
+    if (push_min_interval_ms > 60000)
+        push_min_interval_ms = 60000;
+
+    push_max_payload_bytes = push_max_payload_cfg ? atoi(push_max_payload_cfg) : 262144;
+    if (push_max_payload_bytes < 1024)
+        push_max_payload_bytes = 1024;
+    if (push_max_payload_bytes > (4 * 1024 * 1024))
+        push_max_payload_bytes = 4 * 1024 * 1024;
+
+    push_auth_token_configured = (push_auth_expected && *push_auth_expected) ? 1 : 0;
+
+    msgpack_pack_map(&pk, 3);
     pack_str_kv(&pk, "status", "ok");
+
+    msgpack_pack_str(&pk, 15); msgpack_pack_str_body(&pk, "push_guardrails", 15);
+    msgpack_pack_map(&pk, 16);
+    pack_bool_kv(&pk, "local_only_required", push_local_only);
+    pack_bool_kv(&pk, "auth_token_configured", push_auth_token_configured);
+    pack_str_kv(&pk, "rate_limit_mode", push_guard_mode_name(push_rate_limit_mode));
+    pack_str_kv(&pk, "payload_limit_mode", push_guard_mode_name(push_payload_limit_mode));
+
+    msgpack_pack_str(&pk, 15); msgpack_pack_str_body(&pk, "min_interval_ms", 15);
+    msgpack_pack_int(&pk, push_min_interval_ms);
+
+    msgpack_pack_str(&pk, 17); msgpack_pack_str_body(&pk, "max_payload_bytes", 17);
+    msgpack_pack_int(&pk, push_max_payload_bytes);
+
+    msgpack_pack_str(&pk, 8); msgpack_pack_str_body(&pk, "attempts", 8);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)push_metrics.attempts);
+
+    msgpack_pack_str(&pk, 8); msgpack_pack_str_body(&pk, "accepted", 8);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)push_metrics.accepted);
+
+    msgpack_pack_str(&pk, 18); msgpack_pack_str_body(&pk, "rejected_transport", 18);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)push_metrics.rejected_transport);
+
+    msgpack_pack_str(&pk, 21); msgpack_pack_str_body(&pk, "rejected_unauthorized", 21);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)push_metrics.rejected_unauthorized);
+
+    msgpack_pack_str(&pk, 19); msgpack_pack_str_body(&pk, "rejected_rate_limit", 19);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)push_metrics.rejected_rate_limit);
+
+    msgpack_pack_str(&pk, 26); msgpack_pack_str_body(&pk, "rejected_payload_too_large", 26);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)push_metrics.rejected_payload_too_large);
+
+    msgpack_pack_str(&pk, 14); msgpack_pack_str_body(&pk, "rejected_other", 14);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)push_metrics.rejected_other);
+
+    msgpack_pack_str(&pk, 19); msgpack_pack_str_body(&pk, "observed_rate_limit", 19);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)push_metrics.observed_rate_limit);
+
+    msgpack_pack_str(&pk, 26); msgpack_pack_str_body(&pk, "observed_payload_too_large", 26);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)push_metrics.observed_payload_too_large);
+
+    msgpack_pack_str(&pk, 20); msgpack_pack_str_body(&pk, "last_attempt_ms", 20);
+    msgpack_pack_long_long(&pk, last_push_attempt_ms);
+
+    msgpack_pack_str(&pk, 10); msgpack_pack_str_body(&pk, "catalog_db", 10);
+    msgpack_pack_map(&pk, 13);
+    pack_str_kv(&pk, "backend_requested", backend_requested);
+    pack_str_kv(&pk, "backend_effective", backend_effective);
+    pack_bool_kv(&pk, "lmdb_build_enabled", g_catalog_backend_choice.lmdb_supported ? 1 : 0);
+    pack_bool_kv(&pk, "fallback_to_json", g_catalog_backend_choice.fallback_to_json ? 1 : 0);
+    pack_bool_kv(&pk, "lmdb_ready", lmdb_ready);
+
+    msgpack_pack_str(&pk, 10); msgpack_pack_str_body(&pk, "generation", 10);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)lmdb_stats.generation);
+
+    msgpack_pack_str(&pk, 13); msgpack_pack_str_body(&pk, "reload_events", 13);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)lmdb_stats.reload_events);
+
+    msgpack_pack_str(&pk, 15); msgpack_pack_str_body(&pk, "reload_poll_sec", 15);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)lmdb_stats.reload_poll_sec);
+
+    msgpack_pack_str(&pk, 13); msgpack_pack_str_body(&pk, "cache_entries", 13);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)lmdb_stats.entries);
+
+    msgpack_pack_str(&pk, 17); msgpack_pack_str_body(&pk, "cache_max_entries", 17);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)lmdb_stats.max_entries);
+
+    msgpack_pack_str(&pk, 10); msgpack_pack_str_body(&pk, "cache_hits", 10);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)lmdb_stats.hits);
+
+    msgpack_pack_str(&pk, 12); msgpack_pack_str_body(&pk, "cache_misses", 12);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)lmdb_stats.misses);
+
+    msgpack_pack_str(&pk, 15); msgpack_pack_str_body(&pk, "cache_evictions", 15);
+    msgpack_pack_unsigned_long_long(&pk, (unsigned long long)lmdb_stats.evictions);
 
     void *data = malloc(sbuf.size);
     if (data) { memcpy(data, sbuf.data, sbuf.size); *out_len = sbuf.size; }
@@ -3177,7 +3686,8 @@ static void handle_health_request(wrp_req_t *req)
  */
 static int decode_push_request(const uint8_t *payload, size_t len,
                                 char **plane_out, long *base_version_out,
-                                long *target_version_out, cJSON **diff_out)
+                                long *target_version_out, cJSON **diff_out,
+                                char **auth_token_out)
 {
     int ok = 0;
     msgpack_unpacked result;
@@ -3202,6 +3712,8 @@ static int decode_push_request(const uint8_t *payload, size_t len,
                 else if (kv->val.type == MSGPACK_OBJECT_NEGATIVE_INTEGER) *target_version_out = (long)kv->val.via.i64;
             } else if (kl == 4 && memcmp(k, "diff", 4) == 0 && kv->val.type == MSGPACK_OBJECT_MAP) {
                 *diff_out = msgpack_obj_to_cjson(&kv->val);
+            } else if (kl == 10 && memcmp(k, "auth_token", 10) == 0 && kv->val.type == MSGPACK_OBJECT_STR) {
+                *auth_token_out = strndup(kv->val.via.str.ptr, kv->val.via.str.size);
             }
         }
         if (*plane_out) ok = 1;
@@ -3340,9 +3852,13 @@ static void send_changed_notification(int sock, const char *plane, long version)
 static void mprm_notify_capability_sync(const char *plane_name, long version)
 {
     int idx = -1;
+    capability_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
     for (int i = 0; i < PLANE_COUNT; i++)
         if (strcmp(g_planes[i].plane, plane_name) == 0) { idx = i; break; }
     if (idx < 0) return; /* unknown plane -- nothing to report */
+    if (build_plane_capability_snapshot(idx, &snap) != 0)
+        return;
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "jsonrpc", "2.0");
@@ -3357,34 +3873,22 @@ static void mprm_notify_capability_sync(const char *plane_name, long version)
     cJSON *caps = cJSON_CreateArray();
     cJSON_AddItemToObject(params, "capabilities", caps);
 
-    /* Same lock discipline as build_describe_response_payload(): read
-     * the live catalog under g_catalog_mutex. Safe to acquire here --
-     * by the time this fires, catalog_apply_push()'s own promote step
-     * has already released the mutex internally (§15 B.2's swap-then-
-     * unlock ordering), so this is not a re-entrant lock attempt. */
-    pthread_mutex_lock(&g_catalog_mutex);
-    cJSON *tools = g_planes[idx].catalog ? cJSON_GetObjectItem(g_planes[idx].catalog, "tools") : NULL;
-    for (cJSON *e = tools ? tools->child : NULL; e; e = e->next) {
-        cJSON *ty = cJSON_GetObjectItem(e, "type");
-        cJSON *pl = cJSON_GetObjectItem(e, "plane");
-        cJSON *tc = cJSON_GetObjectItem(e, "timeout");
-        const char *name    = e->string ? e->string : "";
-        const char *type_s  = (ty && cJSON_GetStringValue(ty)) ? cJSON_GetStringValue(ty) : "static";
-        const char *plane_s = (pl && cJSON_GetStringValue(pl)) ? cJSON_GetStringValue(pl) : "";
-        int timeout_v = (tc && cJSON_IsNumber(tc)) ? tc->valueint : 0;
-
+    for (size_t i = 0; i < snap.count; i++) {
+        const capability_entry_t *se = &snap.items[i];
         cJSON *entry = cJSON_CreateObject();
-        cJSON_AddStringToObject(entry, "name", name);
-        cJSON_AddStringToObject(entry, "type", type_s);
-        cJSON_AddStringToObject(entry, "plane", plane_s);
-        cJSON_AddNumberToObject(entry, "timeout", timeout_v);
+        cJSON_AddStringToObject(entry, "name", se->name);
+        cJSON_AddStringToObject(entry, "type", se->type);
+        cJSON_AddStringToObject(entry, "plane", se->plane);
+        cJSON_AddNumberToObject(entry, "timeout", se->timeout);
         cJSON_AddItemToArray(caps, entry);
     }
-    pthread_mutex_unlock(&g_catalog_mutex);
 
     char *json_text = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    if (!json_text) return;
+    if (!json_text) {
+        capability_snapshot_free(&snap);
+        return;
+    }
 
     size_t wrp_len = 0;
     void *wrp = build_wrp_json_notification("dns:" SERVICE_NAME, "", "",
@@ -3399,46 +3903,184 @@ static void mprm_notify_capability_sync(const char *plane_name, long version)
             syslog(LOG_INFO, "capability_sync.updated sent: plane='%s' version=%ld", plane_name, version);
     }
     free(wrp);
+    capability_snapshot_free(&snap);
+}
+
+static void mprm_publish_startup_capabilities(void)
+{
+    for (int i = 0; i < PLANE_COUNT; i++) {
+        capability_snapshot_t snap;
+        memset(&snap, 0, sizeof(snap));
+        if (build_plane_capability_snapshot(i, &snap) != 0)
+            continue;
+        if (g_planes[i].catalog || snap.count > 0)
+            mprm_notify_capability_sync(g_planes[i].plane, g_planes[i].version);
+        capability_snapshot_free(&snap);
+    }
+}
+
+static int push_require_local_only_effective(void)
+{
+    const char *cfg = catalog_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_PUSH_REQUIRE_LOCAL_ONLY");
+    return mprm_parse_bool(cfg, PUSH_REQUIRE_LOCAL_ONLY ? 1 : 0);
+}
+
+static int push_auth_token_allowed(const char *provided)
+{
+    const char *expected = catalog_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_PUSH_AUTH_TOKEN");
+    if (!expected || !*expected)
+        return 1;
+    if (!provided || !*provided)
+        return 0;
+    return strcmp(expected, provided) == 0;
+}
+
+static int push_min_interval_ms_effective(void)
+{
+    const char *cfg = catalog_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_PUSH_MIN_INTERVAL_MS");
+    int v = cfg ? atoi(cfg) : 0;
+    if (v < 0)
+        v = 0;
+    if (v > 60000)
+        v = 60000;
+    return v;
+}
+
+static int push_max_payload_bytes_effective(void)
+{
+    const char *cfg = catalog_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_PUSH_MAX_PAYLOAD_BYTES");
+    int v = cfg ? atoi(cfg) : 262144;
+    if (v < 1024)
+        v = 1024;
+    if (v > (4 * 1024 * 1024))
+        v = 4 * 1024 * 1024;
+    return v;
+}
+
+static size_t request_thread_stack_bytes_effective(void)
+{
+    const char *cfg = catalog_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_REQUEST_THREAD_STACK_BYTES");
+    long n = REQUEST_THREAD_STACK_BYTES_DEFAULT;
+    char *endp = NULL;
+
+    if (cfg && *cfg) {
+        n = strtol(cfg, &endp, 10);
+        if (!endp || *endp != '\0')
+            n = REQUEST_THREAD_STACK_BYTES_DEFAULT;
+    }
+
+    if (n < (long)PTHREAD_STACK_MIN)
+        n = (long)PTHREAD_STACK_MIN;
+    if (n > (8L * 1024L * 1024L))
+        n = 8L * 1024L * 1024L;
+    return (size_t)n;
 }
 
 static void handle_push_request(wrp_req_t *req)
 {
     char *plane = NULL;
+    char *auth_token = NULL;
     long base_version = 0, target_version = 0;
     cJSON *diff = NULL;
+    int local_only_required;
+    int push_min_interval_ms;
+    int push_max_payload_bytes;
+    push_guard_mode_t push_rate_limit_mode;
+    push_guard_mode_t push_payload_limit_mode;
 
     push_outcome_t outcome;
     memset(&outcome, 0, sizeof(outcome));
 
-    /* Originally added 2026-08-15 (§15 B.4): rejected any PUSH not
-     * received via the local-only endpoint, since no ACL/authorization
-     * check (§10, §13.4) existed on this path and the public endpoint
-     * was live at the same time during the transition. A
-     * transport-origin check, not a content check -- deliberately
-     * ahead of decode_push_request()/catalog_apply_push(), not inside
-     * either. DESCRIBE and HEALTH still carry no such restriction --
-     * they're read-only/side-effect-free.
-     *
-     * Gated behind PUSH_REQUIRE_LOCAL_ONLY as of 2026-08-16 (see that
-     * #define's own comment for the full rationale and the exposure
-     * this reopens): now 0, so this branch is unreached and every PUSH
-     * is accepted regardless of which socket it arrived on. The check
-     * itself is left fully intact -- reverting is a single #define
-     * flip, not a rebuild, matching this file's own established
-     * pattern (see REGISTER_WITH_PARODUS). */
-    if (PUSH_REQUIRE_LOCAL_ONLY && !req->from_local) {
+    /* Phase 3 hardening: enforce transport + optional shared-token
+     * authorization before decode/apply. Transport gate can be
+     * configured at build-time or runtime; auth token gate activates
+     * only when MULTI_PLANE_RUNTIME_MANAGER_PUSH_AUTH_TOKEN is configured. */
+    local_only_required = push_require_local_only_effective();
+    push_min_interval_ms = push_min_interval_ms_effective();
+    push_max_payload_bytes = push_max_payload_bytes_effective();
+    push_rate_limit_mode = push_guard_mode_effective("MULTI_PLANE_RUNTIME_MANAGER_PUSH_RATE_LIMIT_MODE", PUSH_GUARD_MODE_ENFORCE);
+    push_payload_limit_mode = push_guard_mode_effective("MULTI_PLANE_RUNTIME_MANAGER_PUSH_PAYLOAD_LIMIT_MODE", PUSH_GUARD_MODE_ENFORCE);
+
+    if (local_only_required && !req->from_local) {
         outcome.status = PUSH_ERR_FORBIDDEN_TRANSPORT;
         snprintf(outcome.reason, sizeof(outcome.reason),
                  "PUSH is only accepted on the local endpoint");
-        syslog(LOG_WARNING, "PUSH rejected: received via public endpoint");
-    } else {
+        syslog(LOG_WARNING, "PUSH rejected: transport=public src=%s",
+               req->source ? req->source : "?");
+    } else if (req->payload_len > (size_t)push_max_payload_bytes) {
+        if (push_payload_limit_mode == PUSH_GUARD_MODE_ENFORCE) {
+            outcome.status = PUSH_ERR_PAYLOAD_TOO_LARGE;
+            snprintf(outcome.reason, sizeof(outcome.reason),
+                     "PUSH payload too large");
+            syslog(LOG_WARNING,
+                   "PUSH rejected: payload too large src=%s transport=%s size=%zu limit=%d",
+                   req->source ? req->source : "?",
+                   req->from_local ? "local" : "public",
+                   req->payload_len,
+                   push_max_payload_bytes);
+        } else if (push_payload_limit_mode == PUSH_GUARD_MODE_MONITOR) {
+            push_guard_metrics_observe_payload_too_large();
+            syslog(LOG_WARNING,
+                   "PUSH guardrail monitor: payload too large src=%s transport=%s size=%zu limit=%d",
+                   req->source ? req->source : "?",
+                   req->from_local ? "local" : "public",
+                   req->payload_len,
+                   push_max_payload_bytes);
+        }
+    } else if (push_min_interval_ms > 0) {
+        long long now_ms = monotonic_millis();
+        long long delta_ms;
+        int allowed = 1;
+
+        pthread_mutex_lock(&g_push_guard_mutex);
+        delta_ms = (g_last_push_attempt_ms > 0) ? (now_ms - g_last_push_attempt_ms) : (long long)push_min_interval_ms;
+        if (g_last_push_attempt_ms > 0 && delta_ms < (long long)push_min_interval_ms) {
+            allowed = 0;
+        } else {
+            g_last_push_attempt_ms = now_ms;
+        }
+        pthread_mutex_unlock(&g_push_guard_mutex);
+
+        if (!allowed) {
+            if (push_rate_limit_mode == PUSH_GUARD_MODE_ENFORCE) {
+                outcome.status = PUSH_ERR_RATE_LIMIT;
+                snprintf(outcome.reason, sizeof(outcome.reason),
+                         "PUSH rate-limited");
+                syslog(LOG_WARNING,
+                       "PUSH rejected: rate-limited src=%s transport=%s delta_ms=%lld min_interval_ms=%d",
+                       req->source ? req->source : "?",
+                       req->from_local ? "local" : "public",
+                       delta_ms,
+                       push_min_interval_ms);
+            } else if (push_rate_limit_mode == PUSH_GUARD_MODE_MONITOR) {
+                push_guard_metrics_observe_rate_limit();
+                syslog(LOG_WARNING,
+                       "PUSH guardrail monitor: rate-limit src=%s transport=%s delta_ms=%lld min_interval_ms=%d",
+                       req->source ? req->source : "?",
+                       req->from_local ? "local" : "public",
+                       delta_ms,
+                       push_min_interval_ms);
+            }
+        }
+    }
+
+    if (outcome.status == PUSH_OK) {
         int decoded = 0;
         if (req->payload && req->payload_len > 0)
             decoded = decode_push_request(req->payload, req->payload_len,
-                                           &plane, &base_version, &target_version, &diff);
+                                           &plane, &base_version, &target_version, &diff,
+                                           &auth_token);
         if (!decoded || !plane) {
             outcome.status = PUSH_ERR_UNKNOWN_PLANE;
             snprintf(outcome.reason, sizeof(outcome.reason), "malformed PUSH request: no 'plane' field");
+        } else if (!push_auth_token_allowed(auth_token)) {
+            outcome.status = PUSH_ERR_UNAUTHORIZED;
+            snprintf(outcome.reason, sizeof(outcome.reason), "PUSH authorization failed");
+            syslog(LOG_WARNING,
+                   "PUSH rejected: unauthorized src=%s transport=%s token_present=%d",
+                   req->source ? req->source : "?",
+                   req->from_local ? "local" : "public",
+                   (auth_token && *auth_token) ? 1 : 0);
         } else {
             cJSON *empty_diff = NULL;
             if (!diff) { empty_diff = cJSON_CreateObject(); }
@@ -3446,6 +4088,8 @@ static void handle_push_request(wrp_req_t *req)
             if (empty_diff) cJSON_Delete(empty_diff);
         }
     }
+
+    push_guard_metrics_record(outcome.status);
 
     size_t pl = 0;
     void *payload = build_push_response_payload(&outcome, plane, &pl);
@@ -3483,6 +4127,7 @@ static void handle_push_request(wrp_req_t *req)
     }
 
     if (diff) cJSON_Delete(diff);
+    free(auth_token);
     free(plane);
     wrp_req_free(req);
     free(req);
@@ -3557,6 +4202,14 @@ static void service_one_message(int recv_sock, int reply_sock, int from_local)
             pthread_attr_t attr;
             pthread_attr_init(&attr);
             pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            {
+                size_t stack_bytes = request_thread_stack_bytes_effective();
+                if (pthread_attr_setstacksize(&attr, stack_bytes) != 0) {
+                    syslog(LOG_WARNING,
+                           "request thread stack size rejected (%zu), using pthread default",
+                           stack_bytes);
+                }
+            }
             if (pthread_create(&tid, &attr,
                     (void *(*)(void *))handle_local_request, req) == 0) {
                 req = NULL; /* thread owns it now */
@@ -3617,6 +4270,46 @@ int main(int argc, char *argv[])
     syslog(LOG_INFO, "starting (nanomsg-direct) parodus=%s client=%s",
            PARODUS_URL, CLIENT_URL);
 
+        mprm_catalog_backend_select(&g_catalog_backend_choice);
+        if (g_catalog_backend_choice.fallback_to_json) {
+         syslog(LOG_WARNING,
+             "catalog backend requested=%s effective=%s source=%s (LMDB backend not built; fallback to JSON)",
+                   mprm_catalog_backend_name(g_catalog_backend_choice.requested),
+                   mprm_catalog_backend_name(g_catalog_backend_choice.effective),
+                   g_catalog_backend_choice.source);
+        } else {
+         syslog(LOG_INFO,
+             "catalog backend requested=%s effective=%s source=%s",
+                   mprm_catalog_backend_name(g_catalog_backend_choice.requested),
+                   mprm_catalog_backend_name(g_catalog_backend_choice.effective),
+                   g_catalog_backend_choice.source);
+        }
+
+        if (g_catalog_backend_choice.effective == MPRM_CATALOG_BACKEND_LMDB) {
+            char lmdb_path[PATH_MAX];
+            if (mprm_catalog_backend_lmdb_init(lmdb_path, sizeof(lmdb_path))) {
+                syslog(LOG_INFO, "catalog backend LMDB initialized: path=%s", lmdb_path);
+                if (env_bool("MULTI_PLANE_RUNTIME_MANAGER_LMDB_AUTO_SYNC_FROM_JSON", 0)) {
+                    const char *import_dir = catalog_dir_override ? catalog_dir_override : CATALOG_DIR;
+                    unsigned long imported = 0;
+                    if (mprm_catalog_backend_lmdb_import_from_catalog_dir(import_dir, &imported)) {
+                        syslog(LOG_INFO,
+                               "catalog backend LMDB auto-sync completed from %s (imported=%lu entries)",
+                               import_dir, imported);
+                    } else {
+                        syslog(LOG_WARNING,
+                               "catalog backend LMDB auto-sync failed from %s; continuing with existing LMDB data",
+                               import_dir);
+                    }
+                }
+            } else {
+                syslog(LOG_WARNING,
+                       "catalog backend LMDB init failed; falling back to JSON catalogs");
+                g_catalog_backend_choice.effective = MPRM_CATALOG_BACKEND_JSON;
+                g_catalog_backend_choice.fallback_to_json = 1;
+            }
+        }
+
     signal(SIGTERM, on_signal);
     signal(SIGINT,  on_signal);
 #if MULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS
@@ -3642,6 +4335,7 @@ int main(int argc, char *argv[])
         plugin_cfg_t pcfg;
         diag_host_api_t host_api;
         const char *pdirs;
+        const char *discovery_mode;
         const char *verify_mode;
         const char *conflict_mode;
         memset(&pcfg, 0, sizeof(pcfg));
@@ -3649,6 +4343,7 @@ int main(int argc, char *argv[])
 
         plugin_cfg_load_file();
         pdirs = plugin_cfg_effective_dirs();
+        discovery_mode = plugin_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DISCOVERY_MODE");
         verify_mode = plugin_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_VERIFY_MODE");
         conflict_mode = plugin_cfg_value("MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_CONFLICT_POLICY");
 
@@ -3657,11 +4352,15 @@ int main(int argc, char *argv[])
 
         pcfg.enabled = env_bool("MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_ENABLE", 0);
         pcfg.plugin_dir = (pdirs && *pdirs) ? pdirs : PLUGIN_DIR_DEFAULT;
-        pcfg.poll_interval_sec = env_int("MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_POLL_INTERVAL_SEC", 0);
+        pcfg.discovery_mode = (discovery_mode && *discovery_mode) ? discovery_mode : "hybrid";
+        pcfg.debounce_ms = env_int("MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DEBOUNCE_MS", 200);
+        pcfg.poll_interval_sec = env_int("MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_POLL_INTERVAL_SEC", 60);
         pcfg.conflict_policy = (conflict_mode && strcmp(conflict_mode, "plugin-priority") == 0) ? 1 : 0;
         pcfg.verify_mode = (verify_mode && *verify_mode) ? verify_mode : "off";
         pcfg.catalog_tool_exists_cb = catalog_tool_exists_cb;
         pcfg.catalog_ctx = NULL;
+        pcfg.on_registry_changed_cb = on_plugin_registry_changed;
+        pcfg.registry_changed_ctx = NULL;
 
         if (plugin_manager_init(&g_plugin_manager, &pcfg, &host_api) != 0) {
             syslog(LOG_ERR, "plugin_manager_init failed; dynamic plugins disabled");
@@ -3671,11 +4370,12 @@ int main(int argc, char *argv[])
             plugin_manager_destroy(g_plugin_manager);
             g_plugin_manager = NULL;
         } else {
-             syslog(LOG_INFO, "dynamic plugin manager started: enabled=%d dirs=%s reload_mode=%s poll=%ds conflict=%s verify_mode=%s cfg_source=%s",
+             syslog(LOG_INFO, "dynamic plugin manager started: enabled=%d dirs=%s discovery_mode=%s poll=%ds debounce_ms=%d conflict=%s verify_mode=%s cfg_source=%s",
                  pcfg.enabled,
                  pcfg.plugin_dir,
-                 pcfg.poll_interval_sec > 0 ? "poll" : "notify-or-manual",
+                 pcfg.discovery_mode ? pcfg.discovery_mode : "hybrid",
                  pcfg.poll_interval_sec,
+                 pcfg.debounce_ms,
                    pcfg.conflict_policy ? "plugin-priority" : "reject-plugin-tool",
                    pcfg.verify_mode ? pcfg.verify_mode : "off",
                    g_plugin_cfg.used_path[0] ? g_plugin_cfg.used_path : "(defaults-only)");
@@ -3733,14 +4433,19 @@ int main(int argc, char *argv[])
     if (REGISTER_WITH_PARODUS) {
         size_t reg_len = 0;
         void  *reg_msg = build_registration(&reg_len);
+        int reg_sent_ok = 0;
         if (reg_msg) {
             int rc = nn_send(g_push_sock, reg_msg, reg_len, 0);
             if (rc < 0)
                 syslog(LOG_ERR, "registration send failed: %s", nn_strerror(nn_errno()));
-            else
+            else {
                 syslog(LOG_INFO, "registered with parodus as '%s'", SERVICE_NAME);
+                reg_sent_ok = 1;
+            }
             free(reg_msg);
         }
+        if (reg_sent_ok)
+            mprm_publish_startup_capabilities();
     } else {
         syslog(LOG_INFO, "registration with parodus disabled (§15 B.4 part 2) -- "
                "reachable only via the local endpoint, if active");
@@ -3818,6 +4523,7 @@ int main(int argc, char *argv[])
      * B.4's local endpoint isn't provisioned. */
     struct nn_pollfd pfd[2];
     int pub_idx = 0, loc_idx = -1;
+    long long plugin_publish_pending_since_ms = 0;
     pfd[pub_idx].fd = g_pull_sock;
     if (g_local_enabled) {
         loc_idx = 1;
@@ -3826,23 +4532,64 @@ int main(int argc, char *argv[])
     int nfds = g_local_enabled ? 2 : 1;
 
     while (g_running) {
+        if (g_catalog_backend_choice.effective == MPRM_CATALOG_BACKEND_LMDB) {
+            int cache_invalidated = 0;
+            mprm_catalog_backend_lmdb_reload_poll(monotonic_millis(), &cache_invalidated);
+            if (cache_invalidated) {
+                mprm_lmdb_cache_stats_t st;
+                memset(&st, 0, sizeof(st));
+                mprm_catalog_backend_lmdb_cache_stats(&st);
+                syslog(LOG_INFO,
+                       "lmdb reload detected: generation=%lu reload_events=%lu (cache invalidated)",
+                       st.generation, st.reload_events);
+            }
+        }
 #if MULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS
         if (g_plugin_reload_requested) {
             g_plugin_reload_requested = 0;
             if (g_plugin_manager) {
                 int src = plugin_manager_scan(g_plugin_manager);
-                if (src == 0)
+                if (src == 0) {
                     syslog(LOG_INFO, "dynamic plugin reload completed (SIGHUP)");
-                else
+                    mprm_publish_startup_capabilities();
+                } else
                     syslog(LOG_WARNING, "dynamic plugin reload failed (SIGHUP)");
             }
+        }
+
+        if (g_plugin_publish_requested) {
+            long long now_ms = monotonic_millis();
+            if (plugin_publish_pending_since_ms == 0)
+                plugin_publish_pending_since_ms = now_ms;
+
+            if (now_ms >= plugin_publish_pending_since_ms + PLUGIN_PUBLISH_COALESCE_MS) {
+                g_plugin_publish_requested = 0;
+                plugin_publish_pending_since_ms = 0;
+                if (g_plugin_manager) {
+                    mprm_publish_startup_capabilities();
+                    syslog(LOG_INFO, "coalesced capability publication emitted after plugin watcher change");
+                }
+            }
+        } else {
+            plugin_publish_pending_since_ms = 0;
         }
 #endif
 
         pfd[pub_idx].events = NN_POLLIN; pfd[pub_idx].revents = 0;
         if (loc_idx >= 0) { pfd[loc_idx].events = NN_POLLIN; pfd[loc_idx].revents = 0; }
 
-        int pr = nn_poll(pfd, nfds, RECV_TIMEOUT_MS);
+        int poll_timeout_ms = RECV_TIMEOUT_MS;
+    #if MULTI_PLANE_RUNTIME_MANAGER_ENABLE_DYNAMIC_PLUGINS
+        if (g_plugin_publish_requested && plugin_publish_pending_since_ms > 0) {
+            long long now_ms = monotonic_millis();
+            long long due_ms = plugin_publish_pending_since_ms + PLUGIN_PUBLISH_COALESCE_MS;
+            int wait_ms = (due_ms > now_ms) ? (int)(due_ms - now_ms) : 0;
+            if (wait_ms < poll_timeout_ms)
+            poll_timeout_ms = wait_ms;
+        }
+    #endif
+
+        int pr = nn_poll(pfd, nfds, poll_timeout_ms);
         if (pr < 0) {
             if (nn_errno() == EINTR) continue;
             if (g_running)
@@ -3885,6 +4632,16 @@ shutdown:
     for (int i = 0; i < PLANE_COUNT; i++) {
         if (g_planes[i].catalog) cJSON_Delete(g_planes[i].catalog);
     }
+    if (g_catalog_backend_choice.effective == MPRM_CATALOG_BACKEND_LMDB) {
+        mprm_lmdb_cache_stats_t st;
+        memset(&st, 0, sizeof(st));
+        mprm_catalog_backend_lmdb_cache_stats(&st);
+        syslog(LOG_INFO,
+             "lmdb cache stats: hits=%lu misses=%lu evictions=%lu entries=%lu max_entries=%lu generation=%lu reload_events=%lu poll_sec=%lu",
+             st.hits, st.misses, st.evictions, st.entries, st.max_entries,
+             st.generation, st.reload_events, st.reload_poll_sec);
+    }
+    mprm_catalog_backend_lmdb_shutdown();
     mprm_log_shutdown();
     closelog();
     return 0;

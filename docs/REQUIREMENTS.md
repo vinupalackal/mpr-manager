@@ -5,6 +5,32 @@ Date: 2026-07-30
 Project: Multi-Plane Runtime Manager
 Document Type: Requirements Baseline (As-Built + Target)
 
+## Consolidation notice (2026-08-20)
+
+This file is the unified requirements source for the project.
+
+It consolidates and supersedes these previously separate requirement documents:
+
+- DYNAMIC_PLUGIN_REQUIREMENTS.md
+- CAPABILITY_PUBLICATION_REQUIREMENTS.md
+- HYBRID_WATCHER_REQUIREMENTS.md
+- METADATA_FIELDS_REQUIREMENTS.md
+- METADATA_PLANE_TAXONOMY_REQUIREMENTS.md
+
+### Consolidated requirements domains
+
+In addition to baseline service requirements, this unified document now covers:
+
+1. Dynamic plugin lifecycle, safety, and conflict-policy requirements.
+2. Hybrid watcher behavior, reconcile cadence, and churn resilience.
+3. Capability publication correctness (catalog + dynamic aggregation) and
+  notification consistency.
+4. Metadata field validation, policy enforcement, strict/compat behavior, and
+  canonical plane taxonomy alignment.
+5. PUSH security and availability controls including local-only policy,
+  optional authorization token, payload/rate guardrails, and rollout modes.
+6. Observability requirements for guardrail posture and runtime counters.
+
 > **Corrections applied 2026-08-14** — see
 > `docs/24_diag_server_merge_plan.md` §2 in the RDK Dispatcher project.
 > NFR-20's status and Risk item 1 below described a build/source
@@ -571,3 +597,91 @@ unused dependencies were removed from the build configuration.
 - Sample catalog reference: `multi-plane-runtime-manager-triage-catalog.json`
 - Build/reference configuration: `CMakeLists.txt`
 - Architecture/workflow context: `README.md`
+
+## 15. Lightweight Catalog Database Target (Draft, 2026-08-21)
+
+This section defines a target-state option to reduce resident memory for
+catalog/toolset handling by replacing fully resident parsed JSON catalogs with a
+database-backed lookup path.
+
+### 15.1 Scope
+
+- Applies to tool catalog storage and lookup only.
+- Command execution, transport protocol, and policy semantics remain unchanged.
+- Canonical planes remain unchanged: `triage`, `management`, `control`,
+  `config-apply`.
+
+### 15.2 Functional requirements (database mode)
+
+FR-33: The service shall support an LMDB-backed catalog mode where tool entries
+are stored as key/value records.
+Acceptance:
+- Service opens LMDB environment and reads entries without requiring an external
+  database daemon process.
+
+FR-34: The service shall identify tool entries by composite key
+`<plane>:<tool>`.
+Acceptance:
+- Duplicate tool names across different planes do not collide.
+- Lookup by `plane` + `tool` returns only the intended record.
+
+FR-35: The service shall support the four catalog planes in LMDB using the same
+request semantics as current catalog mode.
+Acceptance:
+- All four planes are queryable.
+- Plane miss and tool miss behavior matches current response semantics.
+
+FR-36: The service shall include a bounded in-process LRU cache for hot tool
+records.
+Acceptance:
+- Cache size is configurable and hard-capped.
+- Cache hit path avoids LMDB read transaction for the same key.
+
+FR-37: The service shall detect catalog updates and refresh runtime lookup state
+without full process restart.
+Acceptance:
+- Filesystem event notifications (inotify or platform-equivalent watcher) or a
+  periodic polling fallback trigger a generation/version change.
+- Stale cache entries are invalidated on generation/version change.
+
+FR-38: The service shall preserve command-safety policy behavior in database
+mode.
+Acceptance:
+- Existing checks (blocked-token policy, static/dynamic type handling,
+  override-policy behavior) remain unchanged from current semantics.
+
+FR-39: The service shall expose observability for database mode state.
+Acceptance:
+- Health/log surfaces include at least: active catalog generation/version,
+  cache size limit, cache hit/miss counters, and reload/update counters.
+
+### 15.3 Non-functional requirements (database mode)
+
+NFR-21: Resident memory for catalog runtime state should be bounded primarily by
+cache size rather than total catalog size.
+
+NFR-22: Cache-hit lookup latency should remain near constant time for steady
+state hot keys.
+
+NFR-23: LMDB-backed lookups should maintain request-path reliability under
+concurrent reader load.
+
+NFR-24: Catalog updates in LMDB mode should be atomic and crash-consistent.
+
+NFR-25: The design should not require a separate database server process,
+maintaining embedded-device deployability.
+
+### 15.4 Rollout requirements
+
+FR-40: The implementation shall support phased rollout with fallback.
+Acceptance:
+- Phase A: shadow LMDB reads and parity logging against current catalog path.
+- Phase B: LMDB-primary read with configurable fallback to current catalog path.
+- Phase C: full LMDB-primary mode with fallback disabled.
+
+FR-41: The implementation shall include compatibility verification before full
+cutover.
+Acceptance:
+- CI/integration runs demonstrate no functional regression in execution/policy
+  behavior across all planes.
+

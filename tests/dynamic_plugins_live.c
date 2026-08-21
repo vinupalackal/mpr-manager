@@ -19,6 +19,13 @@ static const char *host_cfg(const char *key)
     (void)key;
     return NULL;
 }
+static int g_registry_changed_events = 0;
+
+static void on_registry_changed(void *ctx)
+{
+    (void)ctx;
+    g_registry_changed_events++;
+}
 
 static int copy_file(const char *src, const char *dst)
 {
@@ -79,6 +86,8 @@ int main(void)
     cfg.poll_interval_sec = 1;
     cfg.conflict_policy = 1; /* plugin-priority */
     cfg.verify_mode = "off";
+    cfg.on_registry_changed_cb = on_registry_changed;
+    cfg.registry_changed_ctx = NULL;
 
     TASSERT(plugin_manager_init(&pm, &cfg, &host) == 0);
     TASSERT(plugin_manager_start(pm) == 0);
@@ -87,6 +96,7 @@ int main(void)
     req.source = "unit-test";
     req.transaction_uuid = "uuid-live";
     req.tool = "plugin_version";
+    TASSERT(g_registry_changed_events >= 1);
 
     rc = plugin_manager_invoke(pm, "plugin_version", &req, &resp);
     TASSERT(rc == PLUGIN_INVOKE_OK);
@@ -100,6 +110,7 @@ int main(void)
 
     unlink(dst_plugin);
     TASSERT(plugin_manager_scan(pm) == 0);
+    TASSERT(g_registry_changed_events >= 2);
 
     rc = plugin_manager_invoke(pm, "plugin_echo", &req, &resp);
     TASSERT(rc == PLUGIN_INVOKE_NOT_FOUND);

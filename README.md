@@ -485,7 +485,9 @@ Runtime flags:
 - `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DIR_MANAGEMENT` (optional)
 - `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DIR_CONTROL` (optional)
 - `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DIR_CONFIG_APPLY` (optional)
-- `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_POLL_INTERVAL_SEC` (default `0`)
+- `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DISCOVERY_MODE` (`notify`, `poll`, or `hybrid`; default `hybrid`)
+- `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_POLL_INTERVAL_SEC` (periodic reconcile interval; default `60`)
+- `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DEBOUNCE_MS` (file stability debounce before load; default `200`)
 - `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_CONFLICT_POLICY` (`reject-plugin-tool` default, or `plugin-priority`)
 - `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_VERIFY_MODE` (`off` in v1; other values logged as unsupported)
 
@@ -495,10 +497,16 @@ Per-plane plugin directory behavior:
 - If none of the plane-specific keys are set, `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DIR` is used.
 
 Reload behavior:
-- `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_POLL_INTERVAL_SEC > 0`: periodic directory scan (poll mode).
-- `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_POLL_INTERVAL_SEC = 0` (default): no periodic scanning overhead.
-  - Linux/OpenWrt: notify-based auto reload (`inotify`) is used.
-  - Other targets: watcher stays off; send `SIGHUP` to trigger a one-shot plugin reload.
+- `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DISCOVERY_MODE=hybrid` (default):
+  - Linux/OpenWrt: notify-based event handling (`inotify`) + periodic reconcile scans.
+  - Other targets: falls back to poll mode with periodic reconcile.
+- `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DISCOVERY_MODE=notify`:
+  - Linux/OpenWrt: notify-based auto reload (`inotify`).
+  - Other targets: watcher setup may fail; prefer `hybrid` or `poll` for portability.
+- `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DISCOVERY_MODE=poll`:
+  - periodic directory scanning only.
+- `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_POLL_INTERVAL_SEC` controls reconcile/scan cadence for `poll` and `hybrid`.
+- `MULTI_PLANE_RUNTIME_MANAGER_PLUGIN_DEBOUNCE_MS` reduces partial-write load risk by delaying load until file metadata is stable.
 
 Daemon-style manual reload:
 - `kill -HUP <multi-plane-runtime-manager-pid>` triggers plugin directory rescan/reload once.
@@ -782,8 +790,9 @@ itself never sends:
   → one plane's `{plane, version, tools:[{name,type,plane,timeout}]}`,
   or (no `plane` given) an array of that shape per currently-loaded
   plane.
-- **HEALTH** — `{"kind":"HEALTH"}` → `{"status":"ok"}`. Side-effect-free;
-  doesn't touch the catalog.
+- **HEALTH** — `{"kind":"HEALTH"}` → `{"status":"ok", "push_guardrails": {...}, "catalog_db": {...}}`.
+  Side-effect-free; includes guardrail posture/counters and catalog backend
+  observability (backend mode, LMDB readiness, generation, cache/reload stats).
 - **PUSH** — `{"kind":"PUSH", "plane", "base_version", "target_version", "diff": {"added":{},"removed":[],"modified":{}}}`
   → `{"status":"loaded","plane","version"}` or
   `{"status":"rejected","plane","reason"}`. `base_version` must match
@@ -881,16 +890,12 @@ changed.
   `ipc:///run/dispatcher/diagnostics-in.sock`, send
   `ipc:///run/dispatcher/diagnostics-out.sock`. PUSH was originally
   restricted to this local endpoint only (a PUSH received via the
-  public pair was rejected outright). **Changed 2026-08-16, by direct
-  instruction**: `PUSH_REQUIRE_LOCAL_ONLY` is now `0`, so PUSH is
-  accepted on either pair, with no ACL check on either — any
-  WRP-addressable caller reaching the public pair can push a new
-  catalog to any plane, subject only to the blocklist/program-pin
-  checks `catalog_apply_push()` already runs on the diff's contents,
-  not on who's allowed to send it. Revert by flipping
-  `PUSH_REQUIRE_LOCAL_ONLY` back to `1`. DESCRIBE/HEALTH/EXEC are
-  reachable on both pairs, as before; EXEC alone is ACL-gated per tool
-  (see `mprm_acl_check()` above).
+  public pair was rejected outright). **Phase 3 hardening (2026-08-20)**:
+  default posture is secure-by-default local-only (`PUSH_REQUIRE_LOCAL_ONLY=1`),
+  with optional shared-token authorization
+  (`MULTI_PLANE_RUNTIME_MANAGER_PUSH_AUTH_TOKEN`) when stronger gatekeeping
+  is required. DESCRIBE/HEALTH/EXEC are reachable on both pairs, as before;
+  EXEC alone is ACL-gated per tool (see `mprm_acl_check()` above).
 - Registration to Parodus (§15 B.4 part 2): `REGISTER_WITH_PARODUS` was
   briefly flipped to `0` on 2026-08-16 (after D.1/D.3 both passed) so
   multi-plane-runtime-manager would stop sending its WRP type-9 registration, making

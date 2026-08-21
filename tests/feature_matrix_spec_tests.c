@@ -57,6 +57,15 @@ static int clamp_poll_interval(int val)
     return val;
 }
 
+static int clamp_request_thread_stack_bytes_model(int v)
+{
+    const int min_stack = 16384; /* conservative portable floor for model tests */
+    const int max_stack = 8 * 1024 * 1024;
+    if (v < min_stack) return min_stack;
+    if (v > max_stack) return max_stack;
+    return v;
+}
+
 static route_t route_kind(const char *kind)
 {
     if (!kind || strcmp(kind, "EXEC") == 0)
@@ -87,6 +96,114 @@ static int would_emit_changed(push_result_t r)
 static int would_emit_capability_sync(push_result_t r)
 {
     return r == PUSH_OK ? 1 : 0;
+}
+
+static int push_transport_allowed(int require_local_only, int from_local)
+{
+    if (require_local_only && !from_local)
+        return 0;
+    return 1;
+}
+
+static int push_auth_allowed(const char *expected, const char *provided)
+{
+    if (!expected || !*expected)
+        return 1;
+    if (!provided || !*provided)
+        return 0;
+    return strcmp(expected, provided) == 0;
+}
+
+static int push_payload_size_allowed(size_t payload_len, size_t max_payload)
+{
+    return payload_len <= max_payload ? 1 : 0;
+}
+
+static int push_rate_limit_allows(long long last_ms, long long now_ms, int min_interval_ms)
+{
+    if (min_interval_ms <= 0)
+        return 1;
+    if (last_ms <= 0)
+        return 1;
+    return (now_ms - last_ms) >= (long long)min_interval_ms ? 1 : 0;
+}
+
+typedef struct {
+    int attempts;
+    int accepted;
+    int rejected_transport;
+    int rejected_unauthorized;
+    int rejected_rate_limit;
+    int rejected_payload_too_large;
+    int rejected_other;
+} push_metrics_model_t;
+
+typedef enum {
+    PUSH_MODEL_OK = 0,
+    PUSH_MODEL_REJECT_TRANSPORT,
+    PUSH_MODEL_REJECT_UNAUTHORIZED,
+    PUSH_MODEL_REJECT_RATE_LIMIT,
+    PUSH_MODEL_REJECT_PAYLOAD_TOO_LARGE,
+    PUSH_MODEL_REJECT_OTHER
+} push_model_status_t;
+
+typedef enum {
+    GUARD_MODE_OFF = 0,
+    GUARD_MODE_MONITOR,
+    GUARD_MODE_ENFORCE
+} guard_mode_t;
+
+static void push_metrics_record_model(push_metrics_model_t *m, push_model_status_t st)
+{
+    if (!m) return;
+    m->attempts++;
+    if (st == PUSH_MODEL_OK) m->accepted++;
+    else if (st == PUSH_MODEL_REJECT_TRANSPORT) m->rejected_transport++;
+    else if (st == PUSH_MODEL_REJECT_UNAUTHORIZED) m->rejected_unauthorized++;
+    else if (st == PUSH_MODEL_REJECT_RATE_LIMIT) m->rejected_rate_limit++;
+    else if (st == PUSH_MODEL_REJECT_PAYLOAD_TOO_LARGE) m->rejected_payload_too_large++;
+    else m->rejected_other++;
+}
+
+static int clamp_push_min_interval_ms_model(int v)
+{
+    if (v < 0) return 0;
+    if (v > 60000) return 60000;
+    return v;
+}
+
+static int clamp_push_max_payload_bytes_model(int v)
+{
+    if (v < 1024) return 1024;
+    if (v > (4 * 1024 * 1024)) return (4 * 1024 * 1024);
+    return v;
+}
+
+static guard_mode_t guard_mode_parse_model(const char *v, guard_mode_t def_mode)
+{
+    if (!v || !*v)
+        return def_mode;
+    if (strcasecmp(v, "off") == 0 || strcmp(v, "0") == 0 || strcasecmp(v, "disabled") == 0)
+        return GUARD_MODE_OFF;
+    if (strcasecmp(v, "monitor") == 0 || strcasecmp(v, "log-only") == 0 || strcasecmp(v, "observe") == 0)
+        return GUARD_MODE_MONITOR;
+    if (strcasecmp(v, "enforce") == 0 || strcmp(v, "1") == 0 || strcasecmp(v, "on") == 0 || strcasecmp(v, "enabled") == 0)
+        return GUARD_MODE_ENFORCE;
+    return def_mode;
+}
+
+static int guard_would_reject_model(guard_mode_t mode, int violated)
+{
+    if (!violated)
+        return 0;
+    return mode == GUARD_MODE_ENFORCE ? 1 : 0;
+}
+
+static void push_observed_record_model(push_metrics_model_t *m, push_model_status_t st)
+{
+    if (!m) return;
+    if (st == PUSH_MODEL_REJECT_RATE_LIMIT) m->rejected_rate_limit++;
+    if (st == PUSH_MODEL_REJECT_PAYLOAD_TOO_LARGE) m->rejected_payload_too_large++;
 }
 
 static lookup_result_t resolve_tool_lookup(int found_count, int plane_explicit)
@@ -215,6 +332,12 @@ static int tc_cfg_006(void) {
     ASSERT_EQ_INT(data, 0);
     return 1;
 }
+static int tc_cfg_007(void) {
+    ASSERT_EQ_INT(clamp_request_thread_stack_bytes_model(1), 16384);
+    ASSERT_EQ_INT(clamp_request_thread_stack_bytes_model(262144), 262144);
+    ASSERT_EQ_INT(clamp_request_thread_stack_bytes_model(16 * 1024 * 1024), 8 * 1024 * 1024);
+    return 1;
+}
 
 /* Kind routing */
 static int tc_kind_001(void) { ASSERT_EQ_INT(route_kind(NULL), ROUTE_EXEC); return 1; }
@@ -240,6 +363,102 @@ static int tc_kind_007(void) {
 static int tc_kind_008(void) {
     push_result_t r = apply_push(3, 3, 1);
     ASSERT_EQ_INT(would_emit_capability_sync(r), 1);
+    return 1;
+}
+
+static int tc_kind_009(void) {
+    ASSERT_EQ_INT(push_transport_allowed(1, 0), 0);
+    return 1;
+}
+
+static int tc_kind_010(void) {
+    ASSERT_EQ_INT(push_transport_allowed(1, 1), 1);
+    ASSERT_EQ_INT(push_transport_allowed(0, 0), 1);
+    return 1;
+}
+
+static int tc_kind_011(void) {
+    ASSERT_EQ_INT(push_auth_allowed("secret", NULL), 0);
+    ASSERT_EQ_INT(push_auth_allowed("secret", "wrong"), 0);
+    return 1;
+}
+
+static int tc_kind_012(void) {
+    ASSERT_EQ_INT(push_auth_allowed("secret", "secret"), 1);
+    ASSERT_EQ_INT(push_auth_allowed(NULL, NULL), 1);
+    ASSERT_EQ_INT(push_auth_allowed("", NULL), 1);
+    return 1;
+}
+
+static int tc_kind_013(void) {
+    ASSERT_EQ_INT(push_payload_size_allowed(1024, 1024), 1);
+    ASSERT_EQ_INT(push_payload_size_allowed(1025, 1024), 0);
+    return 1;
+}
+
+static int tc_kind_014(void) {
+    ASSERT_EQ_INT(push_rate_limit_allows(0, 1000, 250), 1);
+    ASSERT_EQ_INT(push_rate_limit_allows(1000, 1200, 250), 0);
+    ASSERT_EQ_INT(push_rate_limit_allows(1000, 1300, 250), 1);
+    return 1;
+}
+
+static int tc_kind_015(void) {
+    push_metrics_model_t m;
+    memset(&m, 0, sizeof(m));
+
+    push_metrics_record_model(&m, PUSH_MODEL_OK);
+    push_metrics_record_model(&m, PUSH_MODEL_REJECT_TRANSPORT);
+    push_metrics_record_model(&m, PUSH_MODEL_REJECT_UNAUTHORIZED);
+    push_metrics_record_model(&m, PUSH_MODEL_REJECT_RATE_LIMIT);
+    push_metrics_record_model(&m, PUSH_MODEL_REJECT_PAYLOAD_TOO_LARGE);
+    push_metrics_record_model(&m, PUSH_MODEL_REJECT_OTHER);
+
+    ASSERT_EQ_INT(m.attempts, 6);
+    ASSERT_EQ_INT(m.accepted, 1);
+    ASSERT_EQ_INT(m.rejected_transport, 1);
+    ASSERT_EQ_INT(m.rejected_unauthorized, 1);
+    ASSERT_EQ_INT(m.rejected_rate_limit, 1);
+    ASSERT_EQ_INT(m.rejected_payload_too_large, 1);
+    ASSERT_EQ_INT(m.rejected_other, 1);
+    return 1;
+}
+
+static int tc_kind_016(void) {
+    ASSERT_EQ_INT(clamp_push_min_interval_ms_model(-5), 0);
+    ASSERT_EQ_INT(clamp_push_min_interval_ms_model(70000), 60000);
+    ASSERT_EQ_INT(clamp_push_min_interval_ms_model(250), 250);
+
+    ASSERT_EQ_INT(clamp_push_max_payload_bytes_model(10), 1024);
+    ASSERT_EQ_INT(clamp_push_max_payload_bytes_model((5 * 1024 * 1024)), (4 * 1024 * 1024));
+    ASSERT_EQ_INT(clamp_push_max_payload_bytes_model(262144), 262144);
+    return 1;
+}
+
+static int tc_kind_017(void) {
+    ASSERT_EQ_INT(guard_mode_parse_model("enforce", GUARD_MODE_MONITOR), GUARD_MODE_ENFORCE);
+    ASSERT_EQ_INT(guard_mode_parse_model("monitor", GUARD_MODE_ENFORCE), GUARD_MODE_MONITOR);
+    ASSERT_EQ_INT(guard_mode_parse_model("off", GUARD_MODE_ENFORCE), GUARD_MODE_OFF);
+    ASSERT_EQ_INT(guard_mode_parse_model("unknown", GUARD_MODE_ENFORCE), GUARD_MODE_ENFORCE);
+    return 1;
+}
+
+static int tc_kind_018(void) {
+    ASSERT_EQ_INT(guard_would_reject_model(GUARD_MODE_ENFORCE, 1), 1);
+    ASSERT_EQ_INT(guard_would_reject_model(GUARD_MODE_MONITOR, 1), 0);
+    ASSERT_EQ_INT(guard_would_reject_model(GUARD_MODE_OFF, 1), 0);
+    ASSERT_EQ_INT(guard_would_reject_model(GUARD_MODE_ENFORCE, 0), 0);
+    return 1;
+}
+
+static int tc_kind_019(void) {
+    push_metrics_model_t m;
+    memset(&m, 0, sizeof(m));
+    push_observed_record_model(&m, PUSH_MODEL_REJECT_RATE_LIMIT);
+    push_observed_record_model(&m, PUSH_MODEL_REJECT_PAYLOAD_TOO_LARGE);
+    ASSERT_EQ_INT(m.rejected_rate_limit, 1);
+    ASSERT_EQ_INT(m.rejected_payload_too_large, 1);
+    ASSERT_EQ_INT(m.attempts, 0);
     return 1;
 }
 
@@ -284,6 +503,7 @@ int main(void)
     run_case("TC-MPRM-CFG-004", tc_cfg_004);
     run_case("TC-MPRM-CFG-005", tc_cfg_005);
     run_case("TC-MPRM-CFG-006", tc_cfg_006);
+    run_case("TC-MPRM-CFG-007", tc_cfg_007);
 
     run_case("TC-MPRM-KIND-001", tc_kind_001);
     run_case("TC-MPRM-KIND-002", tc_kind_002);
@@ -293,6 +513,17 @@ int main(void)
     run_case("TC-MPRM-KIND-006", tc_kind_006);
     run_case("TC-MPRM-KIND-007", tc_kind_007);
     run_case("TC-MPRM-KIND-008", tc_kind_008);
+    run_case("TC-MPRM-KIND-009", tc_kind_009);
+    run_case("TC-MPRM-KIND-010", tc_kind_010);
+    run_case("TC-MPRM-KIND-011", tc_kind_011);
+    run_case("TC-MPRM-KIND-012", tc_kind_012);
+    run_case("TC-MPRM-KIND-013", tc_kind_013);
+    run_case("TC-MPRM-KIND-014", tc_kind_014);
+    run_case("TC-MPRM-KIND-015", tc_kind_015);
+    run_case("TC-MPRM-KIND-016", tc_kind_016);
+    run_case("TC-MPRM-KIND-017", tc_kind_017);
+    run_case("TC-MPRM-KIND-018", tc_kind_018);
+    run_case("TC-MPRM-KIND-019", tc_kind_019);
 
     run_case("TC-MPRM-WRP-001", tc_wrp_001);
     run_case("TC-MPRM-WRP-002", tc_wrp_002);

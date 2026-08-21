@@ -1,0 +1,20 @@
+[Unit]
+Description=Multi-Plane Runtime Manager
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/multi-plane-runtime-manager /etc/multi-plane-runtime-manager
+Restart=always
+RestartSec=3
+RuntimeDirectory=dispatcher
+RuntimeDirectoryMode=0755
+User=root
+Group=root
+
+# Optional override for alternate config path
+# Environment=MULTI_PLANE_RUNTIME_MANAGER_CONFIG_FILE=/etc/multi-plane-runtime-manager/multi-plane-runtime-manager.conf
+
+[Install]
+WantedBy=multi-user.target

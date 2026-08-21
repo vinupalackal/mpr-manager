@@ -94,7 +94,10 @@ static int str_in_set(const char *s, const char *const *set, size_t n) {
 }
 
 static int is_allowed_plane(const char *plane) {
-    static const char *const allowed[] = {"data", "control", "ops", "diagnostic"};
+    static const char *const allowed[] = {
+        "triage", "management", "control", "config-apply",
+        "diagnostic", "ops", "data"
+    };
     return str_in_set(plane, allowed, sizeof(allowed) / sizeof(allowed[0]));
 }
 
@@ -181,6 +184,28 @@ static int plugin_security_precheck_ok(int path_confined, int owner_ok, int mode
     if (!path_confined || !owner_ok || !mode_ok) return 0;
     if (integrity_required && !integrity_ok) return 0;
     return 1;
+}
+
+static const char *normalized_discovery_mode(const char *mode)
+{
+    if (!mode || !*mode) return "hybrid";
+    if (strcmp(mode, "hybrid") == 0) return "hybrid";
+    if (strcmp(mode, "notify") == 0) return "notify";
+    if (strcmp(mode, "poll") == 0) return "poll";
+    return "hybrid";
+}
+
+static int effective_poll_interval_sec(const char *mode, int poll_interval_sec)
+{
+    (void)normalized_discovery_mode(mode);
+    return poll_interval_sec > 0 ? poll_interval_sec : 60;
+}
+
+static int clamp_debounce_ms(int debounce_ms)
+{
+    if (debounce_ms < 0) return 0;
+    if (debounce_ms > 5000) return 5000;
+    return debounce_ms;
 }
 
 static int names_unique(const char *const *names, size_t n) {
@@ -369,6 +394,33 @@ static int tc_plug_010(void) {
     return 1;
 }
 
+static int tc_plug_011(void) {
+    TEST_ASSERT_STREQ(normalized_discovery_mode(NULL), "hybrid");
+    TEST_ASSERT_STREQ(normalized_discovery_mode(""), "hybrid");
+    TEST_ASSERT_STREQ(normalized_discovery_mode("invalid"), "hybrid");
+    TEST_ASSERT_STREQ(normalized_discovery_mode("notify"), "notify");
+    TEST_ASSERT_STREQ(normalized_discovery_mode("poll"), "poll");
+    TEST_ASSERT_STREQ(normalized_discovery_mode("hybrid"), "hybrid");
+    return 1;
+}
+
+static int tc_plug_012(void) {
+    TEST_ASSERT_EQ_INT(effective_poll_interval_sec("hybrid", 0), 60);
+    TEST_ASSERT_EQ_INT(effective_poll_interval_sec("poll", 0), 60);
+    TEST_ASSERT_EQ_INT(effective_poll_interval_sec("notify", 0), 60);
+    TEST_ASSERT_EQ_INT(effective_poll_interval_sec("hybrid", 25), 25);
+    TEST_ASSERT_EQ_INT(effective_poll_interval_sec("notify", 25), 25);
+    return 1;
+}
+
+static int tc_plug_013(void) {
+    TEST_ASSERT_EQ_INT(clamp_debounce_ms(-1), 0);
+    TEST_ASSERT_EQ_INT(clamp_debounce_ms(0), 0);
+    TEST_ASSERT_EQ_INT(clamp_debounce_ms(200), 200);
+    TEST_ASSERT_EQ_INT(clamp_debounce_ms(9999), 5000);
+    return 1;
+}
+
 typedef struct {
     const char *id;
     int (*fn)(void); /* 1 pass, 0 fail, -1 skip */
@@ -413,7 +465,10 @@ int main(void) {
         {"TC-PLUG-007", tc_plug_007},
         {"TC-PLUG-008", tc_plug_008},
         {"TC-PLUG-009", tc_plug_009},
-        {"TC-PLUG-010", tc_plug_010}
+        {"TC-PLUG-010", tc_plug_010},
+        {"TC-PLUG-011", tc_plug_011},
+        {"TC-PLUG-012", tc_plug_012},
+        {"TC-PLUG-013", tc_plug_013}
     };
     size_t i;
     size_t n = sizeof(tests) / sizeof(tests[0]);
